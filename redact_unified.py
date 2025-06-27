@@ -137,6 +137,18 @@ class RegionStore:
             return True
         return False
 
+    def update(self, page: int, index: int, bbox: list[float], kind: str = 'redact') -> bool:
+        """Update an existing region's coordinates."""
+        self._snapshot()
+        key = str(page)
+        items = self.protect if kind == 'protect' else self.regions
+        arr = items.get(key, [])
+        if 0 <= index < len(arr):
+            arr[index] = bbox
+            self.autosave(force=True)
+            return True
+        return False
+
     def undo(self):
         if not self.history:
             return False
@@ -361,8 +373,8 @@ class PDFRedactorGUI:
     def bind_events(self):
         """Bind keyboard shortcuts"""
         # Use bind_all so shortcuts work regardless of focus widget
-        self.root.bind_all('<Control-z>', self.undo)
-        self.root.bind_all('<Control-y>', self.redo)
+        self.root.bind_all('<Control-z>', self.undo, add='+')
+        self.root.bind_all('<Control-y>', self.redo, add='+')
         self.root.bind('<Left>', self.prev_page)
         self.root.bind('<Right>', self.next_page)
         self.root.bind('<Control-o>', lambda e: self.open_pdf())
@@ -720,12 +732,15 @@ class PDFRedactorGUI:
 
         tab_pats = ttk.Frame(notebook)
         tab_exc = ttk.Frame(notebook)
+        tab_regs = ttk.Frame(notebook)
 
         notebook.add(tab_pats, text='Patterns')
         notebook.add(tab_exc, text='Exclusions')
+        notebook.add(tab_regs, text='Regions')
 
         self.create_patterns_tab(tab_pats)
         self.create_exclusions_tab(tab_exc)
+        self.create_regions_tab(tab_regs)
 
         # Status bar
         self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN)
@@ -810,6 +825,34 @@ class PDFRedactorGUI:
         self.update_exclusions_ui()
         self.update_excluded_passages_ui()
 
+    def create_regions_tab(self, parent):
+        columns = ('page', 'x1', 'y1', 'x2', 'y2', 'kind')
+        self.region_tree = ttk.Treeview(parent, columns=columns, show='headings', selectmode='browse', height=10)
+        for col in columns:
+            self.region_tree.heading(col, text=col.upper())
+            self.region_tree.column(col, width=60, anchor='center')
+        self.region_tree.pack(fill=tk.BOTH, expand=True)
+        self.region_tree.bind('<<TreeviewSelect>>', self.on_region_select)
+        self.region_tree.bind('<Delete>', lambda e: self.delete_selected_region())
+
+        edit = ttk.Frame(parent)
+        edit.pack(fill=tk.X, pady=5)
+        self.reg_label = ttk.Label(edit, text='No selection')
+        self.reg_label.pack(side=tk.LEFT, padx=5)
+
+        self.x1_var = tk.DoubleVar()
+        self.y1_var = tk.DoubleVar()
+        self.x2_var = tk.DoubleVar()
+        self.y2_var = tk.DoubleVar()
+        for lbl, var in [('x1', self.x1_var), ('y1', self.y1_var), ('x2', self.x2_var), ('y2', self.y2_var)]:
+            ttk.Label(edit, text=lbl).pack(side=tk.LEFT)
+            ttk.Entry(edit, textvariable=var, width=6).pack(side=tk.LEFT)
+
+        ttk.Button(edit, text='Update', command=self.update_selected_region).pack(side=tk.LEFT, padx=5)
+        ttk.Button(edit, text='Delete', command=self.delete_selected_region).pack(side=tk.LEFT)
+
+        self.refresh_region_tree()
+
 
     def update_patterns_ui(self):
         """Update patterns UI elements"""
@@ -833,6 +876,57 @@ class PDFRedactorGUI:
         """Update excluded passages UI"""
         self.excluded_passages_txt.delete(1.0, tk.END)
         self.excluded_passages_txt.insert(tk.END, '\n---\n'.join(self.excluded_passages))
+
+    # -------- region management tab ---------
+    def refresh_region_tree(self):
+        if not hasattr(self, 'region_tree'):
+            return
+        self.region_tree.delete(*self.region_tree.get_children())
+        if not self.region_store:
+            return
+        for kind, data in [('redact', self.region_store.regions), ('protect', self.region_store.protect)]:
+            for page_str, regs in data.items():
+                page = int(page_str)
+                for idx, (x1, y1, x2, y2) in enumerate(regs):
+                    iid = f"{kind}-{page}-{idx}"
+                    self.region_tree.insert('', 'end', iid=iid,
+                        values=(page, f"{x1:.1f}", f"{y1:.1f}", f"{x2:.1f}", f"{y2:.1f}", kind))
+
+    def on_region_select(self, event=None):
+        sel = self.region_tree.selection()
+        if not sel:
+            self.reg_label.config(text='No selection')
+            return
+        item = self.region_tree.item(sel[0])
+        page, x1, y1, x2, y2, kind = item['values']
+        self.reg_label.config(text=f"Page {page} - {kind}")
+        self.x1_var.set(float(x1))
+        self.y1_var.set(float(y1))
+        self.x2_var.set(float(x2))
+        self.y2_var.set(float(y2))
+
+    def update_selected_region(self):
+        if not self.region_store:
+            return
+        sel = self.region_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        kind, page, index = iid.split('-')
+        bbox = [self.x1_var.get(), self.y1_var.get(), self.x2_var.get(), self.y2_var.get()]
+        if self.region_store.update(int(page), int(index), bbox, kind=kind):
+            self.refresh_region_tree()
+            self.display_page()
+
+    def delete_selected_region(self):
+        if not self.region_store:
+            return
+        sel = list(self.region_tree.selection())
+        for iid in sel:
+            kind, page, index = iid.split('-')
+            self.region_store.remove(int(page), int(index), kind)
+        self.refresh_region_tree()
+        self.display_page()
 
     def update_patterns_from_ui(self):
         """Sync pattern data from widgets"""
@@ -1100,7 +1194,8 @@ FEATURES:
 • Select text and add to patterns, exclusions, or excluded passages
 • Preview mode shows what will be redacted
 • Configs are auto-saved with timestamps
-• Exclusion keywords and passages override matching redaction patterns'''
+• Exclusion keywords and passages override matching redaction patterns
+• Regions tab lists all drawn boxes for manual editing or deletion (Del key)'''
 
         messagebox.showinfo('Help', msg, parent=self.root)
 
@@ -1134,6 +1229,7 @@ FEATURES:
         )
 
         self.page_label.config(text=f"{self.current_page + 1} / {len(self.doc)}")
+        self.refresh_region_tree()
 
     # Drawing
     def start_draw(self, event):
