@@ -398,6 +398,9 @@ def main():
     parser.add_argument('--gui', action='store_true', help='Launch GUI')
     parser.add_argument('input', nargs='?', help='Input PDF for CLI mode')
     parser.add_argument('output', nargs='?', help='Output PDF for CLI mode')
+    parser.add_argument('--patterns', help='Path to JSON patterns file')
+    parser.add_argument('--exclusions', help='Path to JSON exclusions file')
+    parser.add_argument('--regions', help='Path to JSON region file')
     args = parser.parse_args()
 
     if args.input and not args.output:
@@ -406,13 +409,16 @@ def main():
     if args.gui or not args.input:
         run_gui()
     else:
-        patterns_path = JSONStore.find_latest_file('app_wide', 'patterns')
-        exclusions_path = JSONStore.find_latest_file('app_wide', 'exclusions')
+        patterns_path = Path(args.patterns) if args.patterns else JSONStore.find_latest_file('app_wide', 'patterns')
+        exclusions_path = Path(args.exclusions) if args.exclusions else JSONStore.find_latest_file('app_wide', 'exclusions')
         patterns = json.loads(patterns_path.read_text()) if patterns_path and patterns_path.exists() else {'keywords': [], 'passages': []}
         exclusions = json.loads(exclusions_path.read_text()) if exclusions_path and exclusions_path.exists() else []
         regions = {}
-        stem = Path(args.input).stem
-        region_file = JSONStore.DATA_DIR / f"{stem}_regions_autosave.json"
+        if args.regions:
+            region_file = Path(args.regions)
+        else:
+            stem = Path(args.input).stem
+            region_file = JSONStore.DATA_DIR / f"{stem}_regions_autosave.json"
         if region_file.exists():
             data = json.loads(region_file.read_text())
             regions = data.get('regions', {})
