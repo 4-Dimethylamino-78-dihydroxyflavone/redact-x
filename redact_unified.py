@@ -218,7 +218,7 @@ class PDFRedactorGUI:
         self.current_page = 0
         self.region_store = None
 
-        # drawing mode state ("redact" or "protect")
+        # drawing mode state: 'redact', 'protect', or 'text'
         self.current_tool = 'redact'
 
         self.patterns = {'keywords': [], 'passages': []}
@@ -231,6 +231,10 @@ class PDFRedactorGUI:
         self.root.bind('<Control-y>', self.redo)
         self.root.bind('<Left>', self.prev_page)
         self.root.bind('<Right>', self.next_page)
+        self.root.bind('r', lambda e: self.set_mode('redact'))
+        self.root.bind('p', lambda e: self.set_mode('protect'))
+        self.root.bind('t', lambda e: self.set_mode('text'))
+        self.root.bind('h', lambda e: self.show_help())
 
     # --------------------- config handling --------------------
     def load_app_configs(self):
@@ -288,7 +292,7 @@ class PDFRedactorGUI:
         ttk.Button(toolbar, text='Help', command=self.show_help).pack(side=tk.RIGHT, padx=5)
         # drawing mode toggle
         self.mode_var = tk.StringVar(value=self.current_tool)
-        for mode in ('redact', 'protect'):
+        for mode in ('redact', 'text', 'protect'):
             ttk.Radiobutton(toolbar, text=mode.capitalize(), variable=self.mode_var,
                             value=mode, command=self.on_mode_change).pack(side=tk.LEFT)
 
@@ -363,7 +367,12 @@ class PDFRedactorGUI:
             listbox.delete(i)
 
     def on_mode_change(self):
-        self.current_tool = self.mode_var.get()
+        self.set_mode(self.mode_var.get())
+
+    def set_mode(self, mode: str):
+        """Set current drawing mode and update UI state."""
+        self.current_tool = mode
+        self.mode_var.set(mode)
 
     # --------------------- Navigation & Undo -------------------
     def prev_page(self, *args):
@@ -390,9 +399,18 @@ class PDFRedactorGUI:
             messagebox.showinfo('Saved', 'Regions saved', parent=self.root)
 
     def show_help(self):
-        msg = ('Open a PDF then draw rectangles to redact or protect.\n'
-               'Use Prev/Next to change pages. Middle mouse pans.\n'
-               'Toggle Preview to see blacked out areas. Save Regions to store JSON files.')
+        msg = (
+            'Keyboard shortcuts:\n'
+            '  r - Redact mode\n'
+            '  p - Protect mode\n'
+            '  t - Text select mode\n'
+            '  Left/Right - Prev/Next page\n'
+            '  Ctrl+Z / Ctrl+Y - Undo / Redo\n'
+            '  h - This help window\n\n'
+            'Use the mouse to draw boxes in Redact or Protect modes. In Text mode, drag to select words.\n'
+            'Middle mouse pans the page. Toggle Preview to see blacked out areas.\n'
+            'Save Regions to store JSON files or Save Redacted to export a PDF.'
+        )
         messagebox.showinfo('Help', msg, parent=self.root)
 
     # --------------------- PDF Handling ------------------------
@@ -421,7 +439,10 @@ class PDFRedactorGUI:
     def start_draw(self, event):
         self.start_x = self.canvas.canvasx(event.x)/self.canvas.scale
         self.start_y = self.canvas.canvasy(event.y)/self.canvas.scale
-        color = 'red' if self.current_tool == 'redact' else 'green'
+        if self.current_tool in ('redact', 'text'):
+            color = 'red'
+        else:
+            color = 'green'
         self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=color)
 
     def update_draw(self, event):
@@ -438,10 +459,25 @@ class PDFRedactorGUI:
             y2 = self.canvas.canvasy(event.y)/self.canvas.scale
             rect = [min(self.start_x,x2), min(self.start_y,y2), max(self.start_x,x2), max(self.start_y,y2)]
             if self.region_store:
-                self.region_store.add(self.current_page, rect, kind=self.current_tool)
+                if self.current_tool == 'text':
+                    self.add_text_regions(rect)
+                else:
+                    self.region_store.add(self.current_page, rect, kind=self.current_tool)
             self.canvas.delete(self.temp_rect)
             del self.temp_rect
             self.display_page()
+
+    def add_text_regions(self, rect):
+        """Add redaction boxes around words within the selection rectangle."""
+        if not self.doc:
+            return
+        page = self.doc[self.current_page]
+        x1, y1, x2, y2 = rect
+        for w in page.get_text("words"):
+            wx0, wy0, wx1, wy1, word, *_ = w
+            if wx1 < x1 or wx0 > x2 or wy1 < y1 or wy0 > y2:
+                continue
+            self.region_store.add(self.current_page, [wx0, wy0, wx1, wy1], kind='redact')
 
     # ------------------------- Save ----------------------------
     def save_patterns(self):
@@ -520,7 +556,7 @@ def print_json(data):
 # ---------------------------------------------------------------------------
 # Core redaction logic (headless)
 # ---------------------------------------------------------------------------
-def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str,list], patterns: dict, exclusions: list):
+def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str,list], patterns: dict, exclusions: list, fast_ocr: bool = False):
     doc = fitz.open(input_pdf)
 
     # region redactions
@@ -539,6 +575,25 @@ def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str,list], p
                 continue
             for area in page.search_for(pattern, quads=False):
                 page.add_redact_annot(area, fill=(0,0,0))
+        if fast_ocr and not page.get_text().strip():
+            try:
+                import pytesseract
+                pix = page.get_pixmap()
+                img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+                data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+                words = data.get('text', [])
+                for i, word in enumerate(words):
+                    if not word:
+                        continue
+                    for pattern in all_patterns:
+                        if pattern.lower() == word.lower():
+                            x = data['left'][i]
+                            y = data['top'][i]
+                            w = data['width'][i]
+                            h = data['height'][i]
+                            page.add_redact_annot(fitz.Rect(x, y, x+w, y+h), fill=(0,0,0))
+            except Exception:
+                pass
 
     for page in doc:
         page.apply_redactions()
@@ -559,7 +614,10 @@ def run_gui():
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Unified PDF redactor')
+    parser = argparse.ArgumentParser(
+        description='Unified PDF redactor',
+        formatter_class=argparse.RawTextHelpFormatter
+    )
     parser.add_argument('--gui', action='store_true', help='Launch GUI')
     parser.add_argument('input', nargs='?', help='Input PDF for CLI apply mode')
     parser.add_argument('output', nargs='?', help='Output PDF for CLI apply mode')
@@ -567,6 +625,7 @@ def main():
     parser.add_argument('--exclusions', help='Path to JSON exclusions file')
     parser.add_argument('--regions', help='Path to JSON region file')
     parser.add_argument('--apply', action='store_true', help='Apply redactions (default when input and output provided)')
+    parser.add_argument('--fast-ocr', action='store_true', help='Use Tesseract OCR when pages contain no text')
     parser.add_argument('--list-patterns', action='store_true', help='List saved patterns')
     parser.add_argument('--add-pattern', nargs=2, metavar=('TYPE','TEXT'), help='Add a keyword or passage pattern')
     parser.add_argument('--remove-pattern', nargs=2, metavar=('TYPE','TEXT'), help='Remove a keyword or passage pattern')
@@ -706,7 +765,7 @@ def main():
         else:
             store = load_region_store(input_pdf)
             regions = store.regions
-        apply_redactions(input_pdf, output_pdf, regions, patterns, exclusions)
+        apply_redactions(input_pdf, output_pdf, regions, patterns, exclusions, fast_ocr=args.fast_ocr)
         print(f'Saved to {output_pdf}')
         return
 

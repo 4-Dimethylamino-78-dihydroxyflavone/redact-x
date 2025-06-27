@@ -9,6 +9,8 @@
 - Exclusion list to prevent redaction of matching strings
 - Autosaves region selections and configurations to timestamped JSON files
 - Command-line interface to apply saved settings without launching the GUI
+- Optional fast OCR pass when applying redactions
+- Text selection tool with keyboard shortcuts
 
 ## Installation
 
@@ -50,7 +52,8 @@ The script loads the most recent patterns, exclusions and region selections from
 python redact_unified.py input.pdf output.pdf \
     --patterns custom_patterns.json \
     --exclusions custom_exclusions.json \
-    --regions sample_regions.json
+    --regions sample_regions.json \
+    --fast-ocr
 ```
 
 ## Next steps
@@ -58,7 +61,7 @@ python redact_unified.py input.pdf output.pdf \
 Ideas for future improvements:
 
 - Package the script as a standalone executable for easier distribution.
-- Add OCR support to handle scanned PDFs.
+- Improve OCR accuracy for scanned PDFs.
 - Provide presets for different redaction workflows.
 - Expand unit test coverage, especially for the GUI parts.
 
