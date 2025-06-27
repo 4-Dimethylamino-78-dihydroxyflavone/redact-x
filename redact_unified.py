@@ -341,12 +341,18 @@ class PDFRedactorGUI:
         self.exclusions = []
         self.excluded_passages = []  # New: separate list for excluded passages
 
+        # Remember last pane position for resizable layout
+        self.last_pane_position: int | None = None
+
         self.load_app_configs()
         self.auto_detect_json_files()  # New: auto-detect JSON files
         self.load_prefs()
 
         self.setup_ui()
+        if hasattr(self, 'last_zoom'):
+            self.canvas.scale = self.last_zoom
         self.bind_events()
+        self.start_config_monitor()
 
         # Apply saved window state
         if hasattr(self, 'last_pdf') and self.last_pdf and Path(self.last_pdf).exists():
@@ -422,6 +428,50 @@ class PDFRedactorGUI:
                     self.update_exclusions_ui()
                 except Exception as e:
                     messagebox.showerror("Error", f"Failed to load exclusions: {e}")
+
+    def start_config_monitor(self):
+        """Start polling configuration files for changes"""
+        pat = JSONStore.find_latest_file('app_wide', 'patterns')
+        exc = JSONStore.find_latest_file('app_wide', 'exclusions')
+        self._pattern_mtime = pat.stat().st_mtime if pat and pat.exists() else 0
+        self._exclusion_mtime = exc.stat().st_mtime if exc and exc.exists() else 0
+        self.root.after(2000, self.check_config_files)
+
+    def check_config_files(self):
+        changed = False
+        pat = JSONStore.find_latest_file('app_wide', 'patterns')
+        if pat and pat.exists():
+            m = pat.stat().st_mtime
+            if m != getattr(self, '_pattern_mtime', None):
+                try:
+                    self.patterns = json.loads(pat.read_text())
+                    self.update_patterns_ui()
+                    changed = True
+                except Exception:
+                    pass
+                self._pattern_mtime = m
+
+        exc = JSONStore.find_latest_file('app_wide', 'exclusions')
+        if exc and exc.exists():
+            m = exc.stat().st_mtime
+            if m != getattr(self, '_exclusion_mtime', None):
+                try:
+                    data = json.loads(exc.read_text())
+                    if isinstance(data, list):
+                        self.exclusions = data
+                        self.excluded_passages = []
+                    else:
+                        self.exclusions = data.get('keywords', [])
+                        self.excluded_passages = data.get('passages', [])
+                    self.update_exclusions_ui()
+                    changed = True
+                except Exception:
+                    pass
+                self._exclusion_mtime = m
+
+        if changed:
+            self.schedule_preview_update()
+        self.root.after(2000, self.check_config_files)
 
     # --------------------- config handling --------------------
     def load_app_configs(self):
@@ -518,15 +568,40 @@ class PDFRedactorGUI:
                 if geom:
                     self.root.geometry(geom)
                 self.last_pdf = data.get('last_pdf')
+                self.last_pane_position = data.get('pane_position')
+                self.last_zoom = data.get('last_zoom', 2.0)
             except Exception:
                 pass
 
     def save_prefs(self):
         data = {
             'window_geometry': self.root.geometry(),
-            'last_pdf': getattr(self, 'last_pdf', '')
+            'last_pdf': getattr(self, 'last_pdf', ''),
+            'pane_position': self.last_pane_position,
+            'last_zoom': getattr(self.canvas, 'scale', 2.0)
         }
         JSONStore.write_atomic(JSONStore.PREFS_FILE, data)
+
+    def on_pane_motion(self, event=None):
+        """Save pane position when the splitter is moved"""
+        try:
+            pos = self.main_paned.sashpos(0)
+            if pos != self.last_pane_position:
+                self.last_pane_position = pos
+                # debounce save
+                if hasattr(self, '_pane_timer'):
+                    self.root.after_cancel(self._pane_timer)
+                self._pane_timer = self.root.after(500, self.save_prefs)
+        except Exception:
+            pass
+
+    def schedule_preview_update(self):
+        """Refresh preview shortly if enabled"""
+        if not self.preview_var.get():
+            return
+        if hasattr(self, '_preview_timer'):
+            self.root.after_cancel(self._preview_timer)
+        self._preview_timer = self.root.after(300, self.display_page)
 
     # ---------------------- UI setup ---------------------------
     def setup_ui(self):
@@ -596,16 +671,28 @@ class PDFRedactorGUI:
 
         ttk.Button(toolbar, text='Help', command=self.show_help).pack(side=tk.RIGHT, padx=5)
 
-        # Main area
-        main = ttk.Frame(self.root)
-        main.pack(fill=tk.BOTH, expand=True)
-        main.rowconfigure(0, weight=1)
-        main.columnconfigure(0, weight=3)
-        main.columnconfigure(1, weight=1)
+        # Main area with resizable panes
+        self.main_paned = ttk.Panedwindow(self.root, orient=tk.HORIZONTAL)
+        self.main_paned.pack(fill=tk.BOTH, expand=True)
+
+        canvas_frame = ttk.Frame(self.main_paned)
+        side_frame = ttk.Frame(self.main_paned)
+
+        self.main_paned.add(canvas_frame, weight=3)
+        self.main_paned.add(side_frame, weight=1)
+
+        # Restore previous pane position
+        if self.last_pane_position is not None:
+            try:
+                self.main_paned.sashpos(0, self.last_pane_position)
+            except Exception:
+                pass
+
+        # Track pane movement
+        self.main_paned.bind('<B1-Motion>', self.on_pane_motion)
+        self.main_paned.bind('<ButtonRelease-1>', self.on_pane_motion)
 
         # Canvas area
-        canvas_frame = ttk.Frame(main)
-        canvas_frame.grid(row=0, column=0, sticky='nsew')
         self.canvas = PDFCanvas(canvas_frame)
 
         # Bind canvas events
@@ -623,20 +710,17 @@ class PDFRedactorGUI:
         self.canvas.bind('<Button-5>', self.on_mousewheel)
 
         # Side notebook
-        notebook = ttk.Notebook(main)
-        notebook.grid(row=0, column=1, sticky='nsew')
+        notebook = ttk.Notebook(side_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
 
         tab_pats = ttk.Frame(notebook)
         tab_exc = ttk.Frame(notebook)
-        tab_exc_pass = ttk.Frame(notebook)
 
         notebook.add(tab_pats, text='Patterns')
         notebook.add(tab_exc, text='Exclusions')
-        notebook.add(tab_exc_pass, text='Excluded Passages')
 
         self.create_patterns_tab(tab_pats)
         self.create_exclusions_tab(tab_exc)
-        self.create_excluded_passages_tab(tab_exc_pass)
 
         # Status bar
         self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN)
@@ -670,6 +754,7 @@ class PDFRedactorGUI:
         ttk.Label(parent, text='Passages (separate with ---):').pack(anchor='w', pady=(10, 0))
         self.passages_txt = scrolledtext.ScrolledText(parent, height=8)
         self.passages_txt.pack(fill=tk.BOTH, expand=True, padx=5)
+        self.passages_txt.bind('<KeyRelease>', lambda e: (self.update_patterns_from_ui(), self.schedule_preview_update()))
 
         ttk.Button(parent, text='Save Patterns', command=self.save_patterns).pack(pady=5)
 
@@ -689,7 +774,6 @@ class PDFRedactorGUI:
         exc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.excl_lb.config(yscrollcommand=exc_scroll.set)
 
-        # Entry and buttons
         exc_entry_frame = ttk.Frame(parent)
         exc_entry_frame.pack(fill=tk.X, padx=5, pady=5)
 
@@ -701,36 +785,26 @@ class PDFRedactorGUI:
         ttk.Button(exc_entry_frame, text='Delete',
                    command=lambda: self._del_listbox_item(self.excl_lb)).pack(side=tk.LEFT, padx=2)
 
-        # Add from selection button
-        ttk.Button(parent, text='Add from Text Selection',
+        ttk.Button(parent, text='Add Keyword from Selection',
                    command=self.add_exclusion_from_selection).pack(pady=5)
+
+        ttk.Label(parent, text='Excluded Passages (--- separated):').pack(anchor='w', pady=(10,0))
+        self.excluded_passages_txt = scrolledtext.ScrolledText(parent, height=8)
+        self.excluded_passages_txt.pack(fill=tk.BOTH, expand=True, padx=5)
+        self.excluded_passages_txt.bind('<KeyRelease>', lambda e: (self.update_exclusions_from_ui(), self.schedule_preview_update()))
+
+        pass_btn_frame = ttk.Frame(parent)
+        pass_btn_frame.pack(fill=tk.X, padx=5, pady=5)
+        ttk.Button(pass_btn_frame, text='Add Passage from Selection',
+                   command=self.add_excluded_passage_from_selection).pack(side=tk.LEFT, padx=2)
+        ttk.Button(pass_btn_frame, text='Clear Passages',
+                   command=lambda: self.excluded_passages_txt.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=2)
 
         ttk.Button(parent, text='Save Exclusions', command=self.save_exclusions).pack(pady=5)
 
         self.update_exclusions_ui()
-
-    def create_excluded_passages_tab(self, parent):
-        """Create tab for excluded passages (like version 3)"""
-        ttk.Label(parent, text='Excluded Passages:').pack(anchor='w')
-        ttk.Label(parent, text='(Text here will be preserved from redaction)').pack(anchor='w')
-
-        # Text area for excluded passages
-        self.excluded_passages_txt = scrolledtext.ScrolledText(parent, height=15)
-        self.excluded_passages_txt.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        # Button to add from selection
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        ttk.Button(btn_frame, text='Add from Text Selection',
-                   command=self.add_excluded_passage_from_selection).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text='Clear All',
-                   command=lambda: self.excluded_passages_txt.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=2)
-
-        ttk.Button(parent, text='Save Excluded Passages', command=self.save_excluded_passages).pack(pady=5)
-
-        # Load existing excluded passages
         self.update_excluded_passages_ui()
+
 
     def update_patterns_ui(self):
         """Update patterns UI elements"""
@@ -746,28 +820,52 @@ class PDFRedactorGUI:
         self.excl_lb.delete(0, tk.END)
         for ex in self.exclusions:
             self.excl_lb.insert(tk.END, ex)
+        if hasattr(self, 'excluded_passages_txt'):
+            self.excluded_passages_txt.delete(1.0, tk.END)
+            self.excluded_passages_txt.insert(tk.END, '\n---\n'.join(self.excluded_passages))
 
     def update_excluded_passages_ui(self):
         """Update excluded passages UI"""
         self.excluded_passages_txt.delete(1.0, tk.END)
         self.excluded_passages_txt.insert(tk.END, '\n---\n'.join(self.excluded_passages))
 
+    def update_patterns_from_ui(self):
+        """Sync pattern data from widgets"""
+        self.patterns = {
+            'keywords': list(self.keywords_lb.get(0, tk.END)),
+            'passages': [p.strip() for p in self.passages_txt.get(1.0, tk.END).split('\n---\n') if p.strip()]
+        }
+
+    def update_exclusions_from_ui(self):
+        """Sync exclusion data from widgets"""
+        self.exclusions = list(self.excl_lb.get(0, tk.END))
+        self.excluded_passages = [p.strip() for p in self.excluded_passages_txt.get(1.0, tk.END).split('\n---\n') if p.strip()]
+
     def _add_keyword(self):
         text = self.kw_entry.get().strip()
         if text:
             self.keywords_lb.insert(tk.END, text)
             self.kw_entry.delete(0, tk.END)
+            self.update_patterns_from_ui()
+            self.schedule_preview_update()
 
     def _add_exclusion(self):
         text = self.exc_entry.get().strip()
         if text:
             self.excl_lb.insert(tk.END, text)
             self.exc_entry.delete(0, tk.END)
+            self.update_exclusions_from_ui()
+            self.schedule_preview_update()
 
     def _del_listbox_item(self, listbox: tk.Listbox):
         sel = list(listbox.curselection())
         for i in reversed(sel):
             listbox.delete(i)
+        if listbox == self.keywords_lb:
+            self.update_patterns_from_ui()
+        elif listbox == self.excl_lb:
+            self.update_exclusions_from_ui()
+        self.schedule_preview_update()
 
     def add_exclusion_from_selection(self):
         """Add selected text to exclusions"""
@@ -779,6 +877,8 @@ class PDFRedactorGUI:
         if hasattr(self, 'last_selected_text') and self.last_selected_text:
             self.excl_lb.insert(tk.END, self.last_selected_text)
             self.status_bar.config(text=f"Added to exclusions: {self.last_selected_text[:50]}...")
+            self.update_exclusions_from_ui()
+            self.schedule_preview_update()
         else:
             messagebox.showinfo("Info", "No text selected. Use Text Selection tool to select text first.")
 
@@ -795,6 +895,8 @@ class PDFRedactorGUI:
                 self.excluded_passages_txt.insert(tk.END, '\n---\n')
             self.excluded_passages_txt.insert(tk.END, self.last_selected_text)
             self.status_bar.config(text=f"Added to excluded passages: {self.last_selected_text[:50]}...")
+            self.update_exclusions_from_ui()
+            self.schedule_preview_update()
         else:
             messagebox.showinfo("Info", "No text selected. Use Text Selection tool to select text first.")
 
@@ -869,33 +971,36 @@ class PDFRedactorGUI:
         """Show dialog for text selection actions"""
         dialog = tk.Toplevel(self.root)
         dialog.title("Text Selected")
-        dialog.geometry("400x200")
+        dialog.geometry("500x300")
 
         ttk.Label(dialog, text="Selected text:").pack(padx=10, pady=5)
 
-        text_widget = tk.Text(dialog, height=4, wrap=tk.WORD)
-        text_widget.pack(padx=10, fill=tk.BOTH, expand=True)
+        text_widget = scrolledtext.ScrolledText(dialog, height=6, wrap=tk.WORD)
+        text_widget.pack(padx=10, pady=5, fill=tk.BOTH, expand=True)
         text_widget.insert(1.0, text)
-        text_widget.config(state=tk.DISABLED)
 
         btn_frame = ttk.Frame(dialog)
         btn_frame.pack(pady=10)
 
         ttk.Button(btn_frame, text="Add to Patterns",
-                   command=lambda: self._add_to_patterns(text, dialog)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Add to Exclusions",
-                   command=lambda: self._add_to_exclusions(text, dialog)).pack(side=tk.LEFT, padx=5)
-        ttk.Button(btn_frame, text="Add to Excluded Passages",
-                   command=lambda: self._add_to_excluded_passages(text, dialog)).pack(side=tk.LEFT, padx=5)
+                   command=lambda: self._add_to_patterns(text_widget.get(1.0, tk.END).strip(), dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Add Keyword",
+                   command=lambda: self._add_to_exclusions(text_widget.get(1.0, tk.END).strip(), dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Add Passage",
+                   command=lambda: self._add_to_excluded_passages(text_widget.get(1.0, tk.END).strip(), dialog)).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel",
                    command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
     def _add_to_patterns(self, text, dialog):
         self.keywords_lb.insert(tk.END, text)
+        self.update_patterns_from_ui()
+        self.schedule_preview_update()
         dialog.destroy()
 
     def _add_to_exclusions(self, text, dialog):
         self.excl_lb.insert(tk.END, text)
+        self.update_exclusions_from_ui()
+        self.schedule_preview_update()
         dialog.destroy()
 
     def _add_to_excluded_passages(self, text, dialog):
@@ -903,19 +1008,31 @@ class PDFRedactorGUI:
         if current:
             self.excluded_passages_txt.insert(tk.END, '\n---\n')
         self.excluded_passages_txt.insert(tk.END, text)
+        self.update_exclusions_from_ui()
+        self.schedule_preview_update()
         dialog.destroy()
 
     def on_mousewheel(self, event):
         """Handle mouse wheel scrolling"""
-        # Scroll vertically
+        # Horizontal scrolling when Shift is held or tilt wheel
+        if event.state & 0x0001 or getattr(event, 'num', None) in (6, 7):
+            if event.delta:
+                self.canvas.xview_scroll(int(-1 * (event.delta / 120)), 'units')
+            else:
+                if event.num in (6,):
+                    self.canvas.xview_scroll(-1, 'units')
+                elif event.num in (7,):
+                    self.canvas.xview_scroll(1, 'units')
+            return
+
+        # Vertical scrolling
         if event.delta:
-            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), 'units')
         else:
-            # Linux
             if event.num == 4:
-                self.canvas.yview_scroll(-1, "units")
+                self.canvas.yview_scroll(-1, 'units')
             elif event.num == 5:
-                self.canvas.yview_scroll(1, "units")
+                self.canvas.yview_scroll(1, 'units')
 
     # --------------------- Navigation & Undo -------------------
     def prev_page(self, *args):
@@ -1027,16 +1144,18 @@ FEATURES:
         passages = [p.strip() for p in self.passages_txt.get(1.0, tk.END).split('\n---\n') if p.strip()]
         self.patterns = {'keywords': kws, 'passages': passages}
         self.save_app_configs()
+        self.schedule_preview_update()
 
     def save_exclusions(self):
         self.exclusions = list(self.excl_lb.get(0, tk.END))
-        self.save_app_configs()
-
-    def save_excluded_passages(self):
-        """Save excluded passages from text area"""
         passages = [p.strip() for p in self.excluded_passages_txt.get(1.0, tk.END).split('\n---\n') if p.strip()]
         self.excluded_passages = passages
         self.save_app_configs()
+        self.schedule_preview_update()
+
+    def save_excluded_passages(self):
+        """Backwards compatibility wrapper"""
+        self.save_exclusions()
 
     def save_redacted(self):
         if not self.doc:
