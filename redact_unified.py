@@ -368,6 +368,9 @@ class PDFRedactorGUI:
         self.root.bind('<Control-s>', lambda e: self.save_redacted())
         self.root.bind('<Control-i>', lambda e: self.import_config())
         self.root.bind('<Control-e>', lambda e: self.export_config())
+        self.root.bind('<Control-plus>', lambda e: self.zoom_in())
+        self.root.bind('<Control-minus>', lambda e: self.zoom_out())
+        self.root.bind('<Control-0>', lambda e: self.zoom_reset())
 
         # Tool switching shortcuts
         self.root.bind('<space>', lambda e: self.set_tool_mode(ToolMode.PAN))
@@ -1045,6 +1048,21 @@ class PDFRedactorGUI:
             self.current_page += 1
             self.display_page()
 
+    def zoom_in(self, *args):
+        self.canvas.scale = min(self.canvas.scale * 1.1, 10.0)
+        self.display_page()
+        self.save_prefs()
+
+    def zoom_out(self, *args):
+        self.canvas.scale = max(self.canvas.scale / 1.1, 0.2)
+        self.display_page()
+        self.save_prefs()
+
+    def zoom_reset(self, *args):
+        self.canvas.scale = 1.0
+        self.display_page()
+        self.save_prefs()
+
     def undo(self, *args):
         if self.region_store and self.region_store.undo():
             self.display_page()
@@ -1071,6 +1089,7 @@ SHORTCUTS:
 • Ctrl+S: Save redacted PDF
 • Ctrl+Z/Y: Undo/Redo
 • Ctrl+I/E: Import/Export config
+• Ctrl+Mouse Wheel or Ctrl+ +/-: Zoom in/out (Ctrl+0 resets)
 • Left/Right arrows: Navigate pages
 
 FEATURES:
@@ -1078,7 +1097,8 @@ FEATURES:
 • Draw green rectangles to protect areas from text redaction
 • Select text and add to patterns, exclusions, or excluded passages
 • Preview mode shows what will be redacted
-• Configs are auto-saved with timestamps'''
+• Configs are auto-saved with timestamps
+• Exclusion keywords and passages override matching redaction patterns'''
 
         messagebox.showinfo('Help', msg, parent=self.root)
 
@@ -1104,6 +1124,7 @@ FEATURES:
 
         self.canvas.display(
             p, regs, prot,
+            scale=self.canvas.scale,
             patterns=self.patterns,
             exclusions=self.exclusions,
             excluded_passages=self.excluded_passages,
