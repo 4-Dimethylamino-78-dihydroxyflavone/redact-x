@@ -360,8 +360,9 @@ class PDFRedactorGUI:
 
     def bind_events(self):
         """Bind keyboard shortcuts"""
-        self.root.bind('<Control-z>', self.undo)
-        self.root.bind('<Control-y>', self.redo)
+        # Use bind_all so shortcuts work regardless of focus widget
+        self.root.bind_all('<Control-z>', self.undo)
+        self.root.bind_all('<Control-y>', self.redo)
         self.root.bind('<Left>', self.prev_page)
         self.root.bind('<Right>', self.next_page)
         self.root.bind('<Control-o>', lambda e: self.open_pdf())
@@ -702,6 +703,7 @@ class PDFRedactorGUI:
         self.canvas.bind('<ButtonPress-1>', self.on_canvas_press)
         self.canvas.bind('<B1-Motion>', self.on_canvas_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_canvas_release)
+        self.canvas.bind('<Button-3>', self.on_canvas_right_click)
 
         # Middle mouse for panning always
         self.canvas.bind('<ButtonPress-2>', self.canvas.start_pan)
@@ -1158,6 +1160,52 @@ FEATURES:
             self.canvas.delete(self.temp_rect)
             del self.temp_rect
             self.display_page()
+
+    # Region interaction helpers
+    def find_region_at(self, x: float, y: float):
+        """Return (kind, index) of region containing point or None."""
+        page_key = str(self.current_page)
+        regs = self.region_store.regions.get(page_key, []) if self.region_store else []
+        for i, (x1, y1, x2, y2) in enumerate(regs):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return 'redact', i
+        prot = self.region_store.protect.get(page_key, []) if self.region_store else []
+        for i, (x1, y1, x2, y2) in enumerate(prot):
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return 'protect', i
+        return None
+
+    def delete_region(self, kind: str, index: int):
+        if self.region_store and self.region_store.remove(self.current_page, index, kind=kind):
+            self.display_page()
+
+    def toggle_region_kind(self, kind: str, index: int):
+        if not self.region_store:
+            return
+        page_key = str(self.current_page)
+        if kind == 'redact':
+            rect = self.region_store.regions[page_key][index]
+            self.region_store.remove(self.current_page, index, 'redact')
+            self.region_store.add(self.current_page, rect, kind='protect')
+        else:
+            rect = self.region_store.protect[page_key][index]
+            self.region_store.remove(self.current_page, index, 'protect')
+            self.region_store.add(self.current_page, rect, kind='redact')
+        self.display_page()
+
+    def on_canvas_right_click(self, event):
+        if not self.region_store:
+            return
+        x = self.canvas.canvasx(event.x) / self.canvas.scale
+        y = self.canvas.canvasy(event.y) / self.canvas.scale
+        hit = self.find_region_at(x, y)
+        if not hit:
+            return
+        kind, idx = hit
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label='Delete Region', command=lambda: self.delete_region(kind, idx))
+        menu.add_command(label='Toggle Redact/Protect', command=lambda: self.toggle_region_kind(kind, idx))
+        menu.tk_popup(event.x_root, event.y_root)
 
     # ------------------------- Save ----------------------------
     def save_patterns(self):
