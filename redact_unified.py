@@ -1,25 +1,37 @@
 #!/usr/bin/env python3
-"""Unified PDF redactor GUI + CLI.
+"""Enhanced PDF redactor GUI + CLI with complete feature set.
 
-This single-file version bundles the helper classes and command
-line interface from the various versions into one executable
-script. All configuration files are stored in a folder sharing the
-script name.
+This enhanced version includes:
+- Mouse panning support
+- Text selection mode vs region drawing modes
+- Excluded passages text area (like version 3)
+- Manual JSON import/export
+- Auto-detection of JSON files in launch directory
+- Tool switching between Pan, Text Select, and Draw modes
 """
 
 import argparse
 import json
 import os
 import re
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
 from dataclasses import dataclass, field
 from datetime import datetime
 import time
 from pathlib import Path
+from enum import Enum, auto
 
 import fitz  # PyMuPDF
 from PIL import Image, ImageTk, ImageDraw
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+
+# Tool modes enumeration
+class ToolMode(Enum):
+    PAN = auto()
+    TEXT_SELECT = auto()
+    DRAW_REDACT = auto()
+    DRAW_PROTECT = auto()
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +68,7 @@ class JSONStore:
         files = list(JSONStore.DATA_DIR.glob(f"{stem}_{purpose}_*.json"))
         if not files:
             return None
+
         def _ts(p: Path):
             m = JSONStore._TS_RE.search(p.stem)
             if m:
@@ -64,7 +77,20 @@ class JSONStore:
                 except ValueError:
                     pass
             return datetime.fromtimestamp(p.stat().st_mtime)
+
         return max(files, key=_ts)
+
+    @staticmethod
+    def find_all_json_files() -> list[Path]:
+        """Find all JSON files in the current directory and data directory."""
+        json_files = []
+        # Check script directory
+        script_dir = Path(__file__).parent
+        json_files.extend(script_dir.glob("*.json"))
+        # Check data directory
+        if JSONStore.DATA_DIR.exists():
+            json_files.extend(JSONStore.DATA_DIR.glob("*.json"))
+        return json_files
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +164,6 @@ class RegionStore:
             JSONStore.write_atomic(path, {'regions': self.regions, 'protect': self.protect})
             self.last_autosave = now
 
-    # load/save snapshot to timestamped files
     def save(self):
         fname = JSONStore.get_timestamped_filename(self.pdf_stem, 'regions')
         JSONStore.write_atomic(fname, {'regions': self.regions, 'protect': self.protect})
@@ -172,38 +197,128 @@ class PDFCanvas(tk.Canvas):
         self.page = None
         self.img = None
         self.scale = 2.0
+        self.tool_mode = ToolMode.PAN
+
+        # Text selection state
+        self.selection_start = None
+        self.selection_rect = None
 
     def display(self, page: fitz.Page, regions: list[list], protect: list[list], scale: float = 2.0,
-                patterns: dict | None = None, exclusions: list | None = None, preview: bool = False):
+                patterns: dict | None = None, exclusions: list | None = None,
+                excluded_passages: list | None = None, preview: bool = False):
         self.scale = scale
+        self.page = page
         pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
         img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
         draw = ImageDraw.Draw(img, 'RGBA')
+
+        # Draw regions
         for x1, y1, x2, y2 in regions:
-            draw.rectangle([x1*scale, y1*scale, x2*scale, y2*scale], fill=(255,0,0,80), outline='red', width=2)
+            draw.rectangle([x1 * scale, y1 * scale, x2 * scale, y2 * scale], fill=(255, 0, 0, 80), outline='red',
+                           width=2)
         for x1, y1, x2, y2 in protect:
-            draw.rectangle([x1*scale, y1*scale, x2*scale, y2*scale], fill=(0,255,0,80), outline='green', width=2)
+            draw.rectangle([x1 * scale, y1 * scale, x2 * scale, y2 * scale], fill=(0, 255, 0, 80), outline='green',
+                           width=2)
+
         if preview:
+            # Apply region redactions in preview
             for x1, y1, x2, y2 in regions:
-                draw.rectangle([x1*scale, y1*scale, x2*scale, y2*scale], fill='black')
+                draw.rectangle([x1 * scale, y1 * scale, x2 * scale, y2 * scale], fill='black')
+
+            # Apply text pattern redactions in preview
             if patterns:
                 patt_list = patterns.get('keywords', []) + patterns.get('passages', [])
+                all_exclusions = (exclusions or []) + (excluded_passages or [])
+
                 for pat in patt_list:
-                    if exclusions and any(excl.lower() in pat.lower() for excl in exclusions):
+                    # Skip if pattern matches any exclusion
+                    if any(excl.lower() in pat.lower() for excl in all_exclusions):
                         continue
+
                     for area in page.search_for(pat, quads=False):
-                        draw.rectangle([area.x0*scale, area.y0*scale, area.x1*scale, area.y1*scale], fill='black')
+                        # Check if area is protected
+                        is_protected = False
+                        for px1, py1, px2, py2 in protect:
+                            if (area.x0 >= px1 and area.y0 >= py1 and
+                                    area.x1 <= px2 and area.y1 <= py2):
+                                is_protected = True
+                                break
+
+                        if not is_protected:
+                            # Check context for exclusions
+                            should_redact = True
+                            expanded = fitz.Rect(area)
+                            expanded.x0 -= 20
+                            expanded.x1 += 20
+                            try:
+                                context = page.get_textbox(expanded)
+                                if any(excl.lower() in context.lower() for excl in all_exclusions):
+                                    should_redact = False
+                            except:
+                                pass
+
+                            if should_redact:
+                                draw.rectangle([area.x0 * scale, area.y0 * scale, area.x1 * scale, area.y1 * scale],
+                                               fill='black')
+
         self.img = ImageTk.PhotoImage(img)
         self.delete('all')
         self.create_image(0, 0, image=self.img, anchor='nw')
         self.config(scrollregion=self.bbox('all'))
 
-    # panning helpers
+    def set_tool_mode(self, mode: ToolMode):
+        self.tool_mode = mode
+        # Update cursor based on mode
+        if mode == ToolMode.PAN:
+            self.config(cursor="hand2")
+        elif mode == ToolMode.TEXT_SELECT:
+            self.config(cursor="crosshair")
+        else:
+            self.config(cursor="tcross")
+
+    # Panning helpers
     def start_pan(self, event):
         self.scan_mark(event.x, event.y)
 
     def drag_pan(self, event):
         self.scan_dragto(event.x, event.y, gain=1)
+
+    # Text selection helpers
+    def start_text_selection(self, event):
+        if self.selection_rect:
+            self.delete(self.selection_rect)
+        self.selection_start = (self.canvasx(event.x), self.canvasy(event.y))
+        self.selection_rect = self.create_rectangle(
+            self.selection_start[0], self.selection_start[1],
+            self.selection_start[0], self.selection_start[1],
+            outline='blue', dash=(3, 3), width=2
+        )
+
+    def update_text_selection(self, event):
+        if self.selection_rect and self.selection_start:
+            x, y = self.canvasx(event.x), self.canvasy(event.y)
+            self.coords(self.selection_rect, self.selection_start[0], self.selection_start[1], x, y)
+
+    def end_text_selection(self, event):
+        if self.selection_rect and self.selection_start and self.page:
+            x, y = self.canvasx(event.x), self.canvasy(event.y)
+            # Convert canvas coordinates to page coordinates
+            x0 = min(self.selection_start[0], x) / self.scale
+            y0 = min(self.selection_start[1], y) / self.scale
+            x1 = max(self.selection_start[0], x) / self.scale
+            y1 = max(self.selection_start[1], y) / self.scale
+
+            # Get text in selection
+            rect = fitz.Rect(x0, y0, x1, y1)
+            text = self.page.get_textbox(rect)
+
+            # Clean up
+            self.delete(self.selection_rect)
+            self.selection_rect = None
+            self.selection_start = None
+
+            return text.strip()
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -218,19 +333,95 @@ class PDFRedactorGUI:
         self.current_page = 0
         self.region_store = None
 
-        # drawing mode state ("redact" or "protect")
-        self.current_tool = 'redact'
+        # Current tool mode
+        self.current_tool = ToolMode.PAN
+        self.drawing_mode = 'redact'  # 'redact' or 'protect'
 
         self.patterns = {'keywords': [], 'passages': []}
         self.exclusions = []
+        self.excluded_passages = []  # New: separate list for excluded passages
+
         self.load_app_configs()
+        self.auto_detect_json_files()  # New: auto-detect JSON files
         self.load_prefs()
 
         self.setup_ui()
+        self.bind_events()
+
+        # Apply saved window state
+        if hasattr(self, 'last_pdf') and self.last_pdf and Path(self.last_pdf).exists():
+            self.open_pdf(self.last_pdf)
+
+    def bind_events(self):
+        """Bind keyboard shortcuts"""
         self.root.bind('<Control-z>', self.undo)
         self.root.bind('<Control-y>', self.redo)
         self.root.bind('<Left>', self.prev_page)
         self.root.bind('<Right>', self.next_page)
+        self.root.bind('<Control-o>', lambda e: self.open_pdf())
+        self.root.bind('<Control-s>', lambda e: self.save_redacted())
+        self.root.bind('<Control-i>', lambda e: self.import_config())
+        self.root.bind('<Control-e>', lambda e: self.export_config())
+
+        # Tool switching shortcuts
+        self.root.bind('<space>', lambda e: self.set_tool_mode(ToolMode.PAN))
+        self.root.bind('t', lambda e: self.set_tool_mode(ToolMode.TEXT_SELECT))
+        self.root.bind('r', lambda e: self.set_tool_mode(ToolMode.DRAW_REDACT))
+        self.root.bind('p', lambda e: self.set_tool_mode(ToolMode.DRAW_PROTECT))
+
+    def auto_detect_json_files(self):
+        """Auto-detect and offer to load JSON files from launch directory"""
+        json_files = JSONStore.find_all_json_files()
+
+        # Filter for likely config files
+        pattern_files = [f for f in json_files if 'pattern' in f.name.lower()]
+        exclusion_files = [f for f in json_files if 'exclusion' in f.name.lower()]
+
+        # If we find likely config files, offer to load them
+        if pattern_files or exclusion_files:
+            msg = "Found configuration files in directory:\n\n"
+            if pattern_files:
+                msg += "Pattern files:\n"
+                msg += "\n".join(f"  - {f.name}" for f in pattern_files[:3])
+                if len(pattern_files) > 3:
+                    msg += f"\n  ... and {len(pattern_files) - 3} more"
+                msg += "\n\n"
+            if exclusion_files:
+                msg += "Exclusion files:\n"
+                msg += "\n".join(f"  - {f.name}" for f in exclusion_files[:3])
+                if len(exclusion_files) > 3:
+                    msg += f"\n  ... and {len(exclusion_files) - 3} more"
+
+            msg += "\n\nWould you like to load the most recent ones?"
+
+            # Delay the dialog to ensure main window is created
+            self.root.after(100, lambda: self._ask_load_configs(msg, pattern_files, exclusion_files))
+
+    def _ask_load_configs(self, msg, pattern_files, exclusion_files):
+        """Ask user if they want to load auto-detected configs"""
+        if messagebox.askyesno("Configuration Files Found", msg):
+            if pattern_files:
+                # Load most recent pattern file
+                latest_pattern = max(pattern_files, key=lambda f: f.stat().st_mtime)
+                try:
+                    self.patterns = json.loads(latest_pattern.read_text())
+                    self.update_patterns_ui()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to load patterns: {e}")
+
+            if exclusion_files:
+                # Load most recent exclusion file
+                latest_exclusion = max(exclusion_files, key=lambda f: f.stat().st_mtime)
+                try:
+                    data = json.loads(latest_exclusion.read_text())
+                    if isinstance(data, list):
+                        self.exclusions = data
+                    elif isinstance(data, dict):
+                        self.exclusions = data.get('keywords', [])
+                        self.excluded_passages = data.get('passages', [])
+                    self.update_exclusions_ui()
+                except Exception as e:
+                    messagebox.showerror("Error", f"Failed to load exclusions: {e}")
 
     # --------------------- config handling --------------------
     def load_app_configs(self):
@@ -239,14 +430,85 @@ class PDFRedactorGUI:
         if pat and pat.exists():
             self.patterns = json.loads(pat.read_text())
         if exc and exc.exists():
-            self.exclusions = json.loads(exc.read_text())
+            data = json.loads(exc.read_text())
+            if isinstance(data, list):
+                self.exclusions = data
+            elif isinstance(data, dict):
+                self.exclusions = data.get('keywords', [])
+                self.excluded_passages = data.get('passages', [])
 
     def save_app_configs(self):
         fn1 = JSONStore.get_timestamped_filename('app_wide', 'patterns')
         JSONStore.write_atomic(fn1, self.patterns)
+
+        # Save exclusions with both keywords and passages
         fn2 = JSONStore.get_timestamped_filename('app_wide', 'exclusions')
-        JSONStore.write_atomic(fn2, self.exclusions)
+        exclusion_data = {
+            'keywords': self.exclusions,
+            'passages': self.excluded_passages
+        }
+        JSONStore.write_atomic(fn2, exclusion_data)
+
         messagebox.showinfo('Saved', 'Configs saved to data folder.', parent=self.root)
+
+    def import_config(self):
+        """Manually import configuration from JSON file"""
+        filename = filedialog.askopenfilename(
+            title="Import Configuration",
+            filetypes=[('JSON files', '*.json'), ('All files', '*.*')]
+        )
+        if filename:
+            try:
+                with open(filename, 'r') as f:
+                    data = json.load(f)
+
+                # Determine what type of config this is
+                if 'keywords' in data or 'passages' in data:
+                    # It's a patterns file
+                    self.patterns = data
+                    self.update_patterns_ui()
+                    messagebox.showinfo("Success", "Patterns imported successfully")
+                elif isinstance(data, list):
+                    # It's a simple exclusions list
+                    self.exclusions = data
+                    self.update_exclusions_ui()
+                    messagebox.showinfo("Success", "Exclusions imported successfully")
+                elif 'exclusions' in data:
+                    # It might be a full config export
+                    if 'patterns' in data:
+                        self.patterns = data['patterns']
+                        self.update_patterns_ui()
+                    if 'exclusions' in data:
+                        self.exclusions = data['exclusions']
+                        self.update_exclusions_ui()
+                    messagebox.showinfo("Success", "Configuration imported successfully")
+                else:
+                    messagebox.showwarning("Warning", "Unrecognized configuration format")
+
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to import configuration:\n{e}")
+
+    def export_config(self):
+        """Export current configuration to JSON file"""
+        filename = filedialog.asksaveasfilename(
+            title="Export Configuration",
+            defaultextension=".json",
+            filetypes=[('JSON files', '*.json'), ('All files', '*.*')],
+            initialfile=f"redaction_config_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        )
+        if filename:
+            try:
+                config = {
+                    'patterns': self.patterns,
+                    'exclusions': self.exclusions,
+                    'excluded_passages': self.excluded_passages,
+                    'exported': datetime.now().isoformat()
+                }
+                with open(filename, 'w') as f:
+                    json.dump(config, f, indent=2)
+                messagebox.showinfo("Success", f"Configuration exported to:\n{filename}")
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to export configuration:\n{e}")
 
     def load_prefs(self):
         if JSONStore.PREFS_FILE.exists():
@@ -268,102 +530,392 @@ class PDFRedactorGUI:
 
     # ---------------------- UI setup ---------------------------
     def setup_ui(self):
+        # Menu bar
+        menubar = tk.Menu(self.root)
+        self.root.config(menu=menubar)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="File", menu=file_menu)
+        file_menu.add_command(label="Open PDF (Ctrl+O)", command=self.open_pdf)
+        file_menu.add_command(label="Save Redacted (Ctrl+S)", command=self.save_redacted)
+        file_menu.add_separator()
+        file_menu.add_command(label="Import Config (Ctrl+I)", command=self.import_config)
+        file_menu.add_command(label="Export Config (Ctrl+E)", command=self.export_config)
+        file_menu.add_separator()
+        file_menu.add_command(label="Exit", command=self.root.quit)
+
+        # Toolbar
         toolbar = ttk.Frame(self.root)
         toolbar.pack(side=tk.TOP, fill=tk.X)
+
         ttk.Button(toolbar, text='Open PDF', command=self.open_pdf).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text='Save Regions', command=self.save_regions).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text='Save Redacted', command=self.save_redacted).pack(side=tk.LEFT, padx=5)
+
         ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+
+        # Tool mode buttons
+        tool_frame = ttk.LabelFrame(toolbar, text="Tool Mode")
+        tool_frame.pack(side=tk.LEFT, padx=5)
+
+        self.tool_var = tk.StringVar(value=ToolMode.PAN.name)
+        ttk.Radiobutton(tool_frame, text="Pan (Space)", variable=self.tool_var,
+                        value=ToolMode.PAN.name, command=self.on_tool_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(tool_frame, text="Text (T)", variable=self.tool_var,
+                        value=ToolMode.TEXT_SELECT.name, command=self.on_tool_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(tool_frame, text="Draw (R/P)", variable=self.tool_var,
+                        value=ToolMode.DRAW_REDACT.name, command=self.on_tool_change).pack(side=tk.LEFT)
+
+        # Drawing mode toggle (redact vs protect)
+        draw_frame = ttk.LabelFrame(toolbar, text="Draw Mode")
+        draw_frame.pack(side=tk.LEFT, padx=5)
+        self.mode_var = tk.StringVar(value='redact')
+        ttk.Radiobutton(draw_frame, text='Redact', variable=self.mode_var,
+                        value='redact', command=self.on_mode_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(draw_frame, text='Protect', variable=self.mode_var,
+                        value='protect', command=self.on_mode_change).pack(side=tk.LEFT)
+
+        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+
+        # Page navigation
         ttk.Button(toolbar, text='< Prev', command=self.prev_page).pack(side=tk.LEFT)
         ttk.Button(toolbar, text='Next >', command=self.next_page).pack(side=tk.LEFT)
-        self.page_label = ttk.Label(toolbar, text='')
+        self.page_label = ttk.Label(toolbar, text='No PDF')
         self.page_label.pack(side=tk.LEFT, padx=10)
+
         ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+
         ttk.Button(toolbar, text='Undo', command=self.undo).pack(side=tk.LEFT)
         ttk.Button(toolbar, text='Redo', command=self.redo).pack(side=tk.LEFT)
-        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
-        self.preview_var = tk.BooleanVar()
-        ttk.Checkbutton(toolbar, text='Preview', variable=self.preview_var, command=self.display_page).pack(side=tk.LEFT)
-        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
-        ttk.Button(toolbar, text='Help', command=self.show_help).pack(side=tk.RIGHT, padx=5)
-        # drawing mode toggle
-        self.mode_var = tk.StringVar(value=self.current_tool)
-        for mode in ('redact', 'protect'):
-            ttk.Radiobutton(toolbar, text=mode.capitalize(), variable=self.mode_var,
-                            value=mode, command=self.on_mode_change).pack(side=tk.LEFT)
 
+        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+
+        self.preview_var = tk.BooleanVar()
+        ttk.Checkbutton(toolbar, text='Preview', variable=self.preview_var, command=self.display_page).pack(
+            side=tk.LEFT)
+
+        ttk.Button(toolbar, text='Help', command=self.show_help).pack(side=tk.RIGHT, padx=5)
+
+        # Main area
         main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True)
         main.rowconfigure(0, weight=1)
         main.columnconfigure(0, weight=3)
         main.columnconfigure(1, weight=1)
 
-        # canvas area
+        # Canvas area
         canvas_frame = ttk.Frame(main)
         canvas_frame.grid(row=0, column=0, sticky='nsew')
         self.canvas = PDFCanvas(canvas_frame)
-        self.canvas.bind('<ButtonPress-1>', self.start_draw)
-        self.canvas.bind('<B1-Motion>', self.update_draw)
-        self.canvas.bind('<ButtonRelease-1>', self.end_draw)
+
+        # Bind canvas events
+        self.canvas.bind('<ButtonPress-1>', self.on_canvas_press)
+        self.canvas.bind('<B1-Motion>', self.on_canvas_drag)
+        self.canvas.bind('<ButtonRelease-1>', self.on_canvas_release)
+
+        # Middle mouse for panning always
         self.canvas.bind('<ButtonPress-2>', self.canvas.start_pan)
         self.canvas.bind('<B2-Motion>', self.canvas.drag_pan)
 
-        # side notebook
+        # Mouse wheel for scrolling
+        self.canvas.bind('<MouseWheel>', self.on_mousewheel)
+        self.canvas.bind('<Button-4>', self.on_mousewheel)
+        self.canvas.bind('<Button-5>', self.on_mousewheel)
+
+        # Side notebook
         notebook = ttk.Notebook(main)
         notebook.grid(row=0, column=1, sticky='nsew')
+
         tab_pats = ttk.Frame(notebook)
         tab_exc = ttk.Frame(notebook)
+        tab_exc_pass = ttk.Frame(notebook)
+
         notebook.add(tab_pats, text='Patterns')
         notebook.add(tab_exc, text='Exclusions')
+        notebook.add(tab_exc_pass, text='Excluded Passages')
+
         self.create_patterns_tab(tab_pats)
         self.create_exclusions_tab(tab_exc)
+        self.create_excluded_passages_tab(tab_exc_pass)
+
+        # Status bar
+        self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
 
     def create_patterns_tab(self, parent):
         ttk.Label(parent, text='Keywords:').pack(anchor='w')
-        self.keywords_lb = tk.Listbox(parent, height=5)
-        self.keywords_lb.pack(fill=tk.BOTH, expand=True, padx=5)
-        for kw in self.patterns.get('keywords', []):
-            self.keywords_lb.insert(tk.END, kw)
-        ent = ttk.Entry(parent)
-        ent.pack(fill=tk.X, padx=5, pady=5)
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text='Add', command=lambda: self._add_listbox_item(ent, self.keywords_lb)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text='Delete', command=lambda: self._del_listbox_item(self.keywords_lb)).pack(side=tk.LEFT, padx=2)
 
-        ttk.Label(parent, text='Passages:').pack(anchor='w', pady=(10,0))
+        kw_frame = ttk.Frame(parent)
+        kw_frame.pack(fill=tk.BOTH, expand=True, padx=5)
+
+        self.keywords_lb = tk.Listbox(kw_frame, height=5)
+        self.keywords_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        kw_scroll = ttk.Scrollbar(kw_frame, command=self.keywords_lb.yview)
+        kw_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.keywords_lb.config(yscrollcommand=kw_scroll.set)
+
+        # Entry and buttons for keywords
+        kw_entry_frame = ttk.Frame(parent)
+        kw_entry_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.kw_entry = ttk.Entry(kw_entry_frame)
+        self.kw_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        ttk.Button(kw_entry_frame, text='Add',
+                   command=lambda: self._add_keyword()).pack(side=tk.LEFT, padx=2)
+        ttk.Button(kw_entry_frame, text='Delete',
+                   command=lambda: self._del_listbox_item(self.keywords_lb)).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(parent, text='Passages (separate with ---):').pack(anchor='w', pady=(10, 0))
         self.passages_txt = scrolledtext.ScrolledText(parent, height=8)
         self.passages_txt.pack(fill=tk.BOTH, expand=True, padx=5)
-        self.passages_txt.insert(tk.END, '\n---\n'.join(self.patterns.get('passages', [])))
-        ttk.Button(parent, text='Save', command=self.save_patterns).pack(pady=5)
+
+        ttk.Button(parent, text='Save Patterns', command=self.save_patterns).pack(pady=5)
+
+        # Update UI with loaded data
+        self.update_patterns_ui()
 
     def create_exclusions_tab(self, parent):
-        ttk.Label(parent, text='Exclusion strings:').pack(anchor='w')
-        self.excl_lb = tk.Listbox(parent)
-        self.excl_lb.pack(fill=tk.BOTH, expand=True, padx=5)
+        ttk.Label(parent, text='Exclusion Keywords:').pack(anchor='w')
+
+        exc_frame = ttk.Frame(parent)
+        exc_frame.pack(fill=tk.BOTH, expand=True, padx=5)
+
+        self.excl_lb = tk.Listbox(exc_frame)
+        self.excl_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        exc_scroll = ttk.Scrollbar(exc_frame, command=self.excl_lb.yview)
+        exc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.excl_lb.config(yscrollcommand=exc_scroll.set)
+
+        # Entry and buttons
+        exc_entry_frame = ttk.Frame(parent)
+        exc_entry_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        self.exc_entry = ttk.Entry(exc_entry_frame)
+        self.exc_entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        ttk.Button(exc_entry_frame, text='Add',
+                   command=lambda: self._add_exclusion()).pack(side=tk.LEFT, padx=2)
+        ttk.Button(exc_entry_frame, text='Delete',
+                   command=lambda: self._del_listbox_item(self.excl_lb)).pack(side=tk.LEFT, padx=2)
+
+        # Add from selection button
+        ttk.Button(parent, text='Add from Text Selection',
+                   command=self.add_exclusion_from_selection).pack(pady=5)
+
+        ttk.Button(parent, text='Save Exclusions', command=self.save_exclusions).pack(pady=5)
+
+        self.update_exclusions_ui()
+
+    def create_excluded_passages_tab(self, parent):
+        """Create tab for excluded passages (like version 3)"""
+        ttk.Label(parent, text='Excluded Passages:').pack(anchor='w')
+        ttk.Label(parent, text='(Text here will be preserved from redaction)').pack(anchor='w')
+
+        # Text area for excluded passages
+        self.excluded_passages_txt = scrolledtext.ScrolledText(parent, height=15)
+        self.excluded_passages_txt.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Button to add from selection
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(btn_frame, text='Add from Text Selection',
+                   command=self.add_excluded_passage_from_selection).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text='Clear All',
+                   command=lambda: self.excluded_passages_txt.delete(1.0, tk.END)).pack(side=tk.LEFT, padx=2)
+
+        ttk.Button(parent, text='Save Excluded Passages', command=self.save_excluded_passages).pack(pady=5)
+
+        # Load existing excluded passages
+        self.update_excluded_passages_ui()
+
+    def update_patterns_ui(self):
+        """Update patterns UI elements"""
+        self.keywords_lb.delete(0, tk.END)
+        for kw in self.patterns.get('keywords', []):
+            self.keywords_lb.insert(tk.END, kw)
+
+        self.passages_txt.delete(1.0, tk.END)
+        self.passages_txt.insert(tk.END, '\n---\n'.join(self.patterns.get('passages', [])))
+
+    def update_exclusions_ui(self):
+        """Update exclusions UI elements"""
+        self.excl_lb.delete(0, tk.END)
         for ex in self.exclusions:
             self.excl_lb.insert(tk.END, ex)
-        ent = ttk.Entry(parent)
-        ent.pack(fill=tk.X, padx=5, pady=5)
-        btn_frame = ttk.Frame(parent)
-        btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text='Add', command=lambda: self._add_listbox_item(ent, self.excl_lb)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_frame, text='Delete', command=lambda: self._del_listbox_item(self.excl_lb)).pack(side=tk.LEFT, padx=2)
-        ttk.Button(parent, text='Save', command=self.save_exclusions).pack(pady=5)
 
-    def _add_listbox_item(self, entry: ttk.Entry, listbox: tk.Listbox):
-        text = entry.get().strip()
+    def update_excluded_passages_ui(self):
+        """Update excluded passages UI"""
+        self.excluded_passages_txt.delete(1.0, tk.END)
+        self.excluded_passages_txt.insert(tk.END, '\n---\n'.join(self.excluded_passages))
+
+    def _add_keyword(self):
+        text = self.kw_entry.get().strip()
         if text:
-            listbox.insert(tk.END, text)
-            entry.delete(0, tk.END)
+            self.keywords_lb.insert(tk.END, text)
+            self.kw_entry.delete(0, tk.END)
+
+    def _add_exclusion(self):
+        text = self.exc_entry.get().strip()
+        if text:
+            self.excl_lb.insert(tk.END, text)
+            self.exc_entry.delete(0, tk.END)
 
     def _del_listbox_item(self, listbox: tk.Listbox):
         sel = list(listbox.curselection())
         for i in reversed(sel):
             listbox.delete(i)
 
+    def add_exclusion_from_selection(self):
+        """Add selected text to exclusions"""
+        if self.current_tool != ToolMode.TEXT_SELECT:
+            messagebox.showinfo("Info", "Switch to Text Selection mode (T) and select text first")
+            return
+
+        # Get last selected text if any
+        if hasattr(self, 'last_selected_text') and self.last_selected_text:
+            self.excl_lb.insert(tk.END, self.last_selected_text)
+            self.status_bar.config(text=f"Added to exclusions: {self.last_selected_text[:50]}...")
+        else:
+            messagebox.showinfo("Info", "No text selected. Use Text Selection tool to select text first.")
+
+    def add_excluded_passage_from_selection(self):
+        """Add selected text to excluded passages"""
+        if self.current_tool != ToolMode.TEXT_SELECT:
+            messagebox.showinfo("Info", "Switch to Text Selection mode (T) and select text first")
+            return
+
+        if hasattr(self, 'last_selected_text') and self.last_selected_text:
+            # Add to text area with separator if not empty
+            current = self.excluded_passages_txt.get(1.0, tk.END).strip()
+            if current:
+                self.excluded_passages_txt.insert(tk.END, '\n---\n')
+            self.excluded_passages_txt.insert(tk.END, self.last_selected_text)
+            self.status_bar.config(text=f"Added to excluded passages: {self.last_selected_text[:50]}...")
+        else:
+            messagebox.showinfo("Info", "No text selected. Use Text Selection tool to select text first.")
+
+    def set_tool_mode(self, mode: ToolMode):
+        """Set the current tool mode"""
+        self.current_tool = mode
+        self.tool_var.set(mode.name)
+        self.canvas.set_tool_mode(mode)
+
+        # Update status bar
+        mode_names = {
+            ToolMode.PAN: "Pan Mode - Click and drag to move",
+            ToolMode.TEXT_SELECT: "Text Selection Mode - Click and drag to select text",
+            ToolMode.DRAW_REDACT: "Draw Mode - Click and drag to create regions",
+            ToolMode.DRAW_PROTECT: "Draw Mode - Click and drag to create regions"
+        }
+        self.status_bar.config(text=mode_names.get(mode, ""))
+
+    def on_tool_change(self):
+        """Handle tool mode change from radio buttons"""
+        mode_name = self.tool_var.get()
+        mode = ToolMode[mode_name]
+
+        # If switching to draw mode, set appropriate drawing mode
+        if mode == ToolMode.DRAW_REDACT:
+            self.mode_var.set('redact')
+            self.drawing_mode = 'redact'
+        elif mode == ToolMode.DRAW_PROTECT:
+            self.mode_var.set('protect')
+            self.drawing_mode = 'protect'
+
+        self.set_tool_mode(mode)
+
     def on_mode_change(self):
-        self.current_tool = self.mode_var.get()
+        """Handle drawing mode change (redact vs protect)"""
+        self.drawing_mode = self.mode_var.get()
+        # Update tool mode to match
+        if self.drawing_mode == 'redact':
+            self.set_tool_mode(ToolMode.DRAW_REDACT)
+        else:
+            self.set_tool_mode(ToolMode.DRAW_PROTECT)
+
+    # Canvas event handlers
+    def on_canvas_press(self, event):
+        if self.current_tool == ToolMode.PAN:
+            self.canvas.start_pan(event)
+        elif self.current_tool == ToolMode.TEXT_SELECT:
+            self.canvas.start_text_selection(event)
+        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT):
+            self.start_draw(event)
+
+    def on_canvas_drag(self, event):
+        if self.current_tool == ToolMode.PAN:
+            self.canvas.drag_pan(event)
+        elif self.current_tool == ToolMode.TEXT_SELECT:
+            self.canvas.update_text_selection(event)
+        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT):
+            self.update_draw(event)
+
+    def on_canvas_release(self, event):
+        if self.current_tool == ToolMode.TEXT_SELECT:
+            text = self.canvas.end_text_selection(event)
+            if text:
+                self.last_selected_text = text
+                self.status_bar.config(text=f"Selected: {text[:100]}...")
+                # Optionally show a dialog asking what to do with the text
+                self.show_text_action_dialog(text)
+        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT):
+            self.end_draw(event)
+
+    def show_text_action_dialog(self, text):
+        """Show dialog for text selection actions"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Text Selected")
+        dialog.geometry("400x200")
+
+        ttk.Label(dialog, text="Selected text:").pack(padx=10, pady=5)
+
+        text_widget = tk.Text(dialog, height=4, wrap=tk.WORD)
+        text_widget.pack(padx=10, fill=tk.BOTH, expand=True)
+        text_widget.insert(1.0, text)
+        text_widget.config(state=tk.DISABLED)
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+
+        ttk.Button(btn_frame, text="Add to Patterns",
+                   command=lambda: self._add_to_patterns(text, dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Add to Exclusions",
+                   command=lambda: self._add_to_exclusions(text, dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Add to Excluded Passages",
+                   command=lambda: self._add_to_excluded_passages(text, dialog)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel",
+                   command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+    def _add_to_patterns(self, text, dialog):
+        self.keywords_lb.insert(tk.END, text)
+        dialog.destroy()
+
+    def _add_to_exclusions(self, text, dialog):
+        self.excl_lb.insert(tk.END, text)
+        dialog.destroy()
+
+    def _add_to_excluded_passages(self, text, dialog):
+        current = self.excluded_passages_txt.get(1.0, tk.END).strip()
+        if current:
+            self.excluded_passages_txt.insert(tk.END, '\n---\n')
+        self.excluded_passages_txt.insert(tk.END, text)
+        dialog.destroy()
+
+    def on_mousewheel(self, event):
+        """Handle mouse wheel scrolling"""
+        # Scroll vertically
+        if event.delta:
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        else:
+            # Linux
+            if event.num == 4:
+                self.canvas.yview_scroll(-1, "units")
+            elif event.num == 5:
+                self.canvas.yview_scroll(1, "units")
 
     # --------------------- Navigation & Undo -------------------
     def prev_page(self, *args):
@@ -372,7 +924,7 @@ class PDFRedactorGUI:
             self.display_page()
 
     def next_page(self, *args):
-        if self.doc and self.current_page < len(self.doc)-1:
+        if self.doc and self.current_page < len(self.doc) - 1:
             self.current_page += 1
             self.display_page()
 
@@ -390,14 +942,32 @@ class PDFRedactorGUI:
             messagebox.showinfo('Saved', 'Regions saved', parent=self.root)
 
     def show_help(self):
-        msg = ('Open a PDF then draw rectangles to redact or protect.\n'
-               'Use Prev/Next to change pages. Middle mouse pans.\n'
-               'Toggle Preview to see blacked out areas. Save Regions to store JSON files.')
+        msg = '''PDF Redactor Help
+
+TOOLS:
+• Pan Mode (Space): Click and drag to move around the PDF
+• Text Select (T): Click and drag to select text
+• Draw Mode (R/P): Draw rectangles to redact or protect areas
+
+SHORTCUTS:
+• Ctrl+O: Open PDF
+• Ctrl+S: Save redacted PDF
+• Ctrl+Z/Y: Undo/Redo
+• Ctrl+I/E: Import/Export config
+• Left/Right arrows: Navigate pages
+
+FEATURES:
+• Draw red rectangles to mark areas for redaction
+• Draw green rectangles to protect areas from text redaction
+• Select text and add to patterns, exclusions, or excluded passages
+• Preview mode shows what will be redacted
+• Configs are auto-saved with timestamps'''
+
         messagebox.showinfo('Help', msg, parent=self.root)
 
     # --------------------- PDF Handling ------------------------
     def open_pdf(self, path=None):
-        filename = path or filedialog.askopenfilename(filetypes=[('PDF files','*.pdf')])
+        filename = path or filedialog.askopenfilename(filetypes=[('PDF files', '*.pdf')])
         if not filename:
             return
         self.doc = fitz.open(filename)
@@ -414,31 +984,39 @@ class PDFRedactorGUI:
         p = self.doc[self.current_page]
         regs = self.region_store.regions.get(str(self.current_page), []) if self.region_store else []
         prot = self.region_store.protect.get(str(self.current_page), []) if self.region_store else []
-        self.canvas.display(p, regs, prot, patterns=self.patterns, exclusions=self.exclusions, preview=self.preview_var.get())
-        self.page_label.config(text=f"{self.current_page+1} / {len(self.doc)}")
 
-    # drawing
+        self.canvas.display(
+            p, regs, prot,
+            patterns=self.patterns,
+            exclusions=self.exclusions,
+            excluded_passages=self.excluded_passages,
+            preview=self.preview_var.get()
+        )
+
+        self.page_label.config(text=f"{self.current_page + 1} / {len(self.doc)}")
+
+    # Drawing
     def start_draw(self, event):
-        self.start_x = self.canvas.canvasx(event.x)/self.canvas.scale
-        self.start_y = self.canvas.canvasy(event.y)/self.canvas.scale
-        color = 'red' if self.current_tool == 'redact' else 'green'
-        self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=color)
+        self.start_x = self.canvas.canvasx(event.x) / self.canvas.scale
+        self.start_y = self.canvas.canvasy(event.y) / self.canvas.scale
+        color = 'red' if self.drawing_mode == 'redact' else 'green'
+        self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=color, width=2)
 
     def update_draw(self, event):
         if hasattr(self, 'temp_rect'):
             self.canvas.coords(self.temp_rect,
-                                self.start_x*self.canvas.scale,
-                                self.start_y*self.canvas.scale,
-                                self.canvas.canvasx(event.x),
-                                self.canvas.canvasy(event.y))
+                               self.start_x * self.canvas.scale,
+                               self.start_y * self.canvas.scale,
+                               self.canvas.canvasx(event.x),
+                               self.canvas.canvasy(event.y))
 
     def end_draw(self, event):
         if hasattr(self, 'temp_rect'):
-            x2 = self.canvas.canvasx(event.x)/self.canvas.scale
-            y2 = self.canvas.canvasy(event.y)/self.canvas.scale
-            rect = [min(self.start_x,x2), min(self.start_y,y2), max(self.start_x,x2), max(self.start_y,y2)]
-            if self.region_store:
-                self.region_store.add(self.current_page, rect, kind=self.current_tool)
+            x2 = self.canvas.canvasx(event.x) / self.canvas.scale
+            y2 = self.canvas.canvasy(event.y) / self.canvas.scale
+            rect = [min(self.start_x, x2), min(self.start_y, y2), max(self.start_x, x2), max(self.start_y, y2)]
+            if self.region_store and (rect[2] - rect[0] > 5) and (rect[3] - rect[1] > 5):
+                self.region_store.add(self.current_page, rect, kind=self.drawing_mode)
             self.canvas.delete(self.temp_rect)
             del self.temp_rect
             self.display_page()
@@ -454,91 +1032,82 @@ class PDFRedactorGUI:
         self.exclusions = list(self.excl_lb.get(0, tk.END))
         self.save_app_configs()
 
+    def save_excluded_passages(self):
+        """Save excluded passages from text area"""
+        passages = [p.strip() for p in self.excluded_passages_txt.get(1.0, tk.END).split('\n---\n') if p.strip()]
+        self.excluded_passages = passages
+        self.save_app_configs()
+
     def save_redacted(self):
         if not self.doc:
             return
         self.region_store.save()
-        output = filedialog.asksaveasfilename(defaultextension='.pdf', filetypes=[('PDF','*.pdf')])
+        output = filedialog.asksaveasfilename(defaultextension='.pdf', filetypes=[('PDF', '*.pdf')])
         if not output:
             return
-        apply_redactions(self.doc.name, output, self.region_store.regions, self.patterns, self.exclusions)
+
+        # Combine exclusions and excluded passages
+        all_exclusions = self.exclusions + self.excluded_passages
+
+        apply_redactions(
+            self.doc.name, output,
+            self.region_store.regions,
+            self.region_store.protect,
+            self.patterns,
+            all_exclusions
+        )
         messagebox.showinfo('Done', f'Saved to {output}', parent=self.root)
-
-
-# ---------------------------------------------------------------------------
-# CLI helpers for configs
-# ---------------------------------------------------------------------------
-def load_patterns(path: str | None = None) -> dict:
-    if path:
-        p = Path(path)
-        if p.exists():
-            return json.loads(p.read_text())
-        return {'keywords': [], 'passages': []}
-    pat = JSONStore.find_latest_file('app_wide', 'patterns')
-    if pat and pat.exists():
-        return json.loads(pat.read_text())
-    return {'keywords': [], 'passages': []}
-
-
-def save_patterns(data: dict, path: str | None = None):
-    if path:
-        JSONStore.write_atomic(Path(path), data)
-    else:
-        fn = JSONStore.get_timestamped_filename('app_wide', 'patterns')
-        JSONStore.write_atomic(fn, data)
-
-
-def load_exclusions(path: str | None = None) -> list:
-    if path:
-        p = Path(path)
-        if p.exists():
-            return json.loads(p.read_text())
-        return []
-    exc = JSONStore.find_latest_file('app_wide', 'exclusions')
-    if exc and exc.exists():
-        return json.loads(exc.read_text())
-    return []
-
-
-def save_exclusions(data: list, path: str | None = None):
-    if path:
-        JSONStore.write_atomic(Path(path), data)
-    else:
-        fn = JSONStore.get_timestamped_filename('app_wide', 'exclusions')
-        JSONStore.write_atomic(fn, data)
-
-
-def load_region_store(pdf: str) -> RegionStore:
-    stem = Path(pdf).stem
-    return RegionStore.load(stem)
-
-
-def print_json(data):
-    print(json.dumps(data, indent=2))
 
 
 # ---------------------------------------------------------------------------
 # Core redaction logic (headless)
 # ---------------------------------------------------------------------------
-def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str,list], patterns: dict, exclusions: list):
+def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str, list],
+                     protect_regions: dict[str, list], patterns: dict, exclusions: list):
     doc = fitz.open(input_pdf)
 
     # region redactions
     for page_num, regs in regions.items():
         page = doc[int(page_num)]
-        for x1,y1,x2,y2 in regs:
-            page.add_redact_annot(fitz.Rect(x1,y1,x2,y2), fill=(0,0,0))
+        for x1, y1, x2, y2 in regs:
+            page.add_redact_annot(fitz.Rect(x1, y1, x2, y2), fill=(0, 0, 0))
 
     # text patterns
     all_patterns = patterns.get('keywords', []).copy()
     all_patterns += patterns.get('passages', [])
 
-    for page in doc:
+    for page_num, page in enumerate(doc):
+        # Get protected regions for this page
+        protected = protect_regions.get(str(page_num), [])
+
         for pattern in all_patterns:
             if any(excl.lower() in pattern.lower() for excl in exclusions):
                 continue
+
             for area in page.search_for(pattern, quads=False):
-                page.add_redact_annot(area, fill=(0,0,0))
+                # Check if area is in a protected region
+                is_protected = False
+                for px1, py1, px2, py2 in protected:
+                    prot_rect = fitz.Rect(px1, py1, px2, py2)
+                    if prot_rect.contains(area):
+                        is_protected = True
+                        break
+
+                if not is_protected:
+                    # Check context for exclusions
+                    should_redact = True
+                    expanded = fitz.Rect(area)
+                    expanded.x0 -= 20
+                    expanded.x1 += 20
+                    try:
+                        context = page.get_textbox(expanded)
+                        if any(excl.lower() in context.lower() for excl in exclusions):
+                            should_redact = False
+                    except:
+                        pass
+
+                    if should_redact:
+                        page.add_redact_annot(area, fill=(0, 0, 0))
 
     for page in doc:
         page.apply_redactions()
@@ -553,164 +1122,79 @@ def run_gui():
     root = tk.Tk()
     app = PDFRedactorGUI(root)
     root.protocol('WM_DELETE_WINDOW', lambda: (app.save_prefs(), root.destroy()))
-    if getattr(app, 'last_pdf', None) and Path(app.last_pdf).exists():
-        app.open_pdf(app.last_pdf)
     root.mainloop()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Unified PDF redactor')
+    parser = argparse.ArgumentParser(description='Enhanced PDF redactor')
     parser.add_argument('--gui', action='store_true', help='Launch GUI')
     parser.add_argument('input', nargs='?', help='Input PDF for CLI apply mode')
     parser.add_argument('output', nargs='?', help='Output PDF for CLI apply mode')
     parser.add_argument('--patterns', help='Path to JSON patterns file')
     parser.add_argument('--exclusions', help='Path to JSON exclusions file')
     parser.add_argument('--regions', help='Path to JSON region file')
-    parser.add_argument('--apply', action='store_true', help='Apply redactions (default when input and output provided)')
-    parser.add_argument('--list-patterns', action='store_true', help='List saved patterns')
-    parser.add_argument('--add-pattern', nargs=2, metavar=('TYPE','TEXT'), help='Add a keyword or passage pattern')
-    parser.add_argument('--remove-pattern', nargs=2, metavar=('TYPE','TEXT'), help='Remove a keyword or passage pattern')
-    parser.add_argument('--list-exclusions', action='store_true', help='List saved exclusions')
-    parser.add_argument('--add-exclusion', metavar='TEXT', help='Add an exclusion string')
-    parser.add_argument('--remove-exclusion', metavar='TEXT', help='Remove an exclusion string')
-    parser.add_argument('--list-regions', nargs='?', const='ALL', metavar='PAGE', help='List regions for PDF (use --input to specify pdf)')
-    parser.add_argument('--add-region', nargs=5, metavar=('PAGE','X1','Y1','X2','Y2'), help='Add region box to PDF')
-    parser.add_argument('--remove-region', nargs=2, metavar=('PAGE','INDEX'), help='Remove region by page and index')
-    parser.add_argument('--undo-region', action='store_true', help='Undo last region edit')
-    parser.add_argument('--redo-region', action='store_true', help='Redo last undone region edit')
-    parser.add_argument('--region-type', choices=['redact','protect'], default='redact', help='Type for --add-region/remove-region')
+    parser.add_argument('--apply', action='store_true', help='Apply redactions')
+
     args = parser.parse_args()
 
-    ops = [args.list_patterns, args.add_pattern, args.remove_pattern,
-           args.list_exclusions, args.add_exclusion, args.remove_exclusion,
-           args.list_regions != None, args.add_region, args.remove_region,
-           args.undo_region, args.redo_region]
-
-    if args.input and not args.output and not any(ops) and not args.apply:
-        parser.error('output PDF required in CLI mode')
-
-    if args.gui or (not args.input and not any(ops) and not args.apply):
+    if args.gui or (not args.input and not args.apply):
         run_gui()
         return
 
-    # pattern operations
-    if args.list_patterns:
-        pats = load_patterns(args.patterns)
-        print_json(pats)
-        return
-    if args.add_pattern:
-        kind, text = args.add_pattern
-        if kind not in ('keyword','passage'):
-            parser.error('pattern type must be keyword or passage')
-        pats = load_patterns(args.patterns)
-        key = 'keywords' if kind == 'keyword' else 'passages'
-        if text in pats.get(key, []):
-            parser.error('pattern already exists')
-        pats.setdefault(key, []).append(text)
-        save_patterns(pats, args.patterns)
-        print('Pattern added')
-        return
-    if args.remove_pattern:
-        kind, text = args.remove_pattern
-        if kind not in ('keyword','passage'):
-            parser.error('pattern type must be keyword or passage')
-        pats = load_patterns(args.patterns)
-        key = 'keywords' if kind == 'keyword' else 'passages'
-        try:
-            pats[key].remove(text)
-        except (KeyError, ValueError):
-            parser.error('pattern not found')
-        save_patterns(pats, args.patterns)
-        print('Pattern removed')
-        return
+    if args.input and not args.output:
+        parser.error('output PDF required in CLI mode')
 
-    # exclusion operations
-    if args.list_exclusions:
-        exc = load_exclusions(args.exclusions)
-        print_json(exc)
-        return
-    if args.add_exclusion:
-        exc = load_exclusions(args.exclusions)
-        if args.add_exclusion in exc:
-            parser.error('exclusion already exists')
-        exc.append(args.add_exclusion)
-        save_exclusions(exc, args.exclusions)
-        print('Exclusion added')
-        return
-    if args.remove_exclusion:
-        exc = load_exclusions(args.exclusions)
-        try:
-            exc.remove(args.remove_exclusion)
-        except ValueError:
-            parser.error('exclusion not found')
-        save_exclusions(exc, args.exclusions)
-        print('Exclusion removed')
-        return
-
-    # region operations require input PDF
-    if args.list_regions is not None or args.add_region or args.remove_region or args.undo_region or args.redo_region:
-        if not args.input:
-            parser.error('input PDF required for region operations')
-        store = load_region_store(args.input)
-        if args.list_regions is not None:
-            page = args.list_regions
-            if page == 'ALL':
-                print_json({'regions': store.regions, 'protect': store.protect})
-            else:
-                page_regions = store.regions.get(str(page), [])
-                page_prot = store.protect.get(str(page), [])
-                print_json({'regions': page_regions, 'protect': page_prot})
-            return
-        if args.add_region:
-            page,x1,y1,x2,y2 = args.add_region
-            store.add(int(page), [float(x1),float(y1),float(x2),float(y2)], kind=args.region_type)
-            store.save()
-            print('Region added')
-            return
-        if args.remove_region:
-            page, idx = args.remove_region
-            ok = store.remove(int(page), int(idx), kind=args.region_type)
-            if not ok:
-                parser.error('no region at that index')
-            store.save()
-            print('Region removed')
-            return
-        if args.undo_region:
-            if not store.undo():
-                parser.error('nothing to undo')
-            store.save()
-            print('Undo done')
-            return
-        if args.redo_region:
-            if not store.redo():
-                parser.error('nothing to redo')
-            store.save()
-            print('Redo done')
-            return
-
-    # apply redactions
+    # CLI mode - apply redactions
     if args.apply or (args.input and args.output):
-        input_pdf = args.input if args.input else args.apply[0] if isinstance(args.apply, list) else None
-        output_pdf = args.output if args.output else args.apply[1] if isinstance(args.apply, list) else None
-        if not input_pdf or not output_pdf:
-            parser.error('input and output required for apply')
-        patterns = load_patterns(args.patterns)
-        exclusions = load_exclusions(args.exclusions)
-        if args.regions:
-            region_file = Path(args.regions)
-            if region_file.exists():
-                data = json.loads(region_file.read_text())
-                regions = data.get('regions', {})
-            else:
-                regions = {}
+        # Load patterns
+        patterns = {'keywords': [], 'passages': []}
+        if args.patterns:
+            with open(args.patterns) as f:
+                patterns = json.load(f)
         else:
-            store = load_region_store(input_pdf)
-            regions = store.regions
-        apply_redactions(input_pdf, output_pdf, regions, patterns, exclusions)
-        print(f'Saved to {output_pdf}')
-        return
+            pat = JSONStore.find_latest_file('app_wide', 'patterns')
+            if pat:
+                patterns = json.loads(pat.read_text())
 
-    parser.print_help()
+        # Load exclusions
+        exclusions = []
+        excluded_passages = []
+        if args.exclusions:
+            with open(args.exclusions) as f:
+                data = json.load(f)
+                if isinstance(data, list):
+                    exclusions = data
+                elif isinstance(data, dict):
+                    exclusions = data.get('keywords', [])
+                    excluded_passages = data.get('passages', [])
+        else:
+            exc = JSONStore.find_latest_file('app_wide', 'exclusions')
+            if exc:
+                data = json.loads(exc.read_text())
+                if isinstance(data, list):
+                    exclusions = data
+                elif isinstance(data, dict):
+                    exclusions = data.get('keywords', [])
+                    excluded_passages = data.get('passages', [])
+
+        # Combine all exclusions
+        all_exclusions = exclusions + excluded_passages
+
+        # Load regions
+        regions = {}
+        protect_regions = {}
+        if args.regions:
+            with open(args.regions) as f:
+                data = json.load(f)
+                regions = data.get('regions', {})
+                protect_regions = data.get('protect', {})
+        else:
+            store = RegionStore.load(Path(args.input).stem)
+            regions = store.regions
+            protect_regions = store.protect
+
+        apply_redactions(args.input, args.output, regions, protect_regions, patterns, all_exclusions)
+        print(f'Saved to {args.output}')
 
 
 if __name__ == '__main__':
