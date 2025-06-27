@@ -44,5 +44,21 @@ Apply redactions using saved settings:
 python redact_unified.py input.pdf output.pdf
 ```
 
-The script loads the most recent patterns, exclusions and region selections from its data folder and writes the redacted PDF to the specified output location.
+The script loads the most recent patterns, exclusions and region selections from its data folder and writes the redacted PDF to the specified output location. You can override these paths:
+
+```bash
+python redact_unified.py input.pdf output.pdf \
+    --patterns custom_patterns.json \
+    --exclusions custom_exclusions.json \
+    --regions sample_regions.json
+```
+
+## Next steps
+
+Ideas for future improvements:
+
+- Package the script as a standalone executable for easier distribution.
+- Add OCR support to handle scanned PDFs.
+- Provide presets for different redaction workflows.
+- Expand unit test coverage, especially for the GUI parts.
 
