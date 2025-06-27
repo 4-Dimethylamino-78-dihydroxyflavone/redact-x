@@ -1,0 +1,20 @@
+{
+  "patterns": {
+    "keywords": [],
+    "passages": []
+  },
+  "exclusions": [],
+  "regions": [
+    {
+      "page": 3,
+      "bbox": [
+        212.39669421487594,
+        199.9999999999999,
+        386.776859504132,
+        647.9338842975203
+      ],
+      "kind": "redact",
+      "canvas_id": null
+    }
+  ]
+}
