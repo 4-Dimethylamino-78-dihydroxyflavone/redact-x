@@ -131,6 +131,16 @@ class RegionStore:
         fname = JSONStore.get_timestamped_filename(self.pdf_stem, 'regions')
         JSONStore.write_atomic(fname, {'regions': self.regions, 'protect': self.protect})
 
+    @classmethod
+    def load(cls, pdf_stem: str):
+        path = JSONStore.find_latest_file(pdf_stem, 'regions')
+        obj = cls(pdf_stem)
+        if path and path.exists():
+            data = json.loads(path.read_text())
+            obj.regions = data.get('regions', {})
+            obj.protect = data.get('protect', {})
+        return obj
+
 
 # ---------------------------------------------------------------------------
 # PDFCanvas - display a fitz.Page with zoom/pan and draw overlays
@@ -151,7 +161,8 @@ class PDFCanvas(tk.Canvas):
         self.img = None
         self.scale = 2.0
 
-    def display(self, page: fitz.Page, regions: list[list], protect: list[list], scale: float = 2.0):
+    def display(self, page: fitz.Page, regions: list[list], protect: list[list], scale: float = 2.0,
+                patterns: dict | None = None, exclusions: list | None = None, preview: bool = False):
         self.scale = scale
         pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
         img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
@@ -160,6 +171,16 @@ class PDFCanvas(tk.Canvas):
             draw.rectangle([x1*scale, y1*scale, x2*scale, y2*scale], fill=(255,0,0,80), outline='red', width=2)
         for x1, y1, x2, y2 in protect:
             draw.rectangle([x1*scale, y1*scale, x2*scale, y2*scale], fill=(0,255,0,80), outline='green', width=2)
+        if preview:
+            for x1, y1, x2, y2 in regions:
+                draw.rectangle([x1*scale, y1*scale, x2*scale, y2*scale], fill='black')
+            if patterns:
+                patt_list = patterns.get('keywords', []) + patterns.get('passages', [])
+                for pat in patt_list:
+                    if exclusions and any(excl.lower() in pat.lower() for excl in exclusions):
+                        continue
+                    for area in page.search_for(pat, quads=False):
+                        draw.rectangle([area.x0*scale, area.y0*scale, area.x1*scale, area.y1*scale], fill='black')
         self.img = ImageTk.PhotoImage(img)
         self.delete('all')
         self.create_image(0, 0, image=self.img, anchor='nw')
@@ -191,8 +212,13 @@ class PDFRedactorGUI:
         self.patterns = {'keywords': [], 'passages': []}
         self.exclusions = []
         self.load_app_configs()
+        self.load_prefs()
 
         self.setup_ui()
+        self.root.bind('<Control-z>', self.undo)
+        self.root.bind('<Control-y>', self.redo)
+        self.root.bind('<Left>', self.prev_page)
+        self.root.bind('<Right>', self.next_page)
 
     # --------------------- config handling --------------------
     def load_app_configs(self):
@@ -210,19 +236,49 @@ class PDFRedactorGUI:
         JSONStore.write_atomic(fn2, self.exclusions)
         messagebox.showinfo('Saved', 'Configs saved to data folder.', parent=self.root)
 
+    def load_prefs(self):
+        if JSONStore.PREFS_FILE.exists():
+            try:
+                data = json.loads(JSONStore.PREFS_FILE.read_text())
+                geom = data.get('window_geometry')
+                if geom:
+                    self.root.geometry(geom)
+                self.last_pdf = data.get('last_pdf')
+            except Exception:
+                pass
+
+    def save_prefs(self):
+        data = {
+            'window_geometry': self.root.geometry(),
+            'last_pdf': getattr(self, 'last_pdf', '')
+        }
+        JSONStore.write_atomic(JSONStore.PREFS_FILE, data)
+
     # ---------------------- UI setup ---------------------------
     def setup_ui(self):
         toolbar = ttk.Frame(self.root)
         toolbar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(toolbar, text='Open PDF', command=self.open_pdf).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Save Regions', command=self.save_regions).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text='Save Redacted', command=self.save_redacted).pack(side=tk.LEFT, padx=5)
+        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+        ttk.Button(toolbar, text='< Prev', command=self.prev_page).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text='Next >', command=self.next_page).pack(side=tk.LEFT)
+        self.page_label = ttk.Label(toolbar, text='')
+        self.page_label.pack(side=tk.LEFT, padx=10)
+        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+        ttk.Button(toolbar, text='Undo', command=self.undo).pack(side=tk.LEFT)
+        ttk.Button(toolbar, text='Redo', command=self.redo).pack(side=tk.LEFT)
+        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+        self.preview_var = tk.BooleanVar()
+        ttk.Checkbutton(toolbar, text='Preview', variable=self.preview_var, command=self.display_page).pack(side=tk.LEFT)
+        ttk.Separator(toolbar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=3)
+        ttk.Button(toolbar, text='Help', command=self.show_help).pack(side=tk.RIGHT, padx=5)
         # drawing mode toggle
         self.mode_var = tk.StringVar(value=self.current_tool)
         for mode in ('redact', 'protect'):
             ttk.Radiobutton(toolbar, text=mode.capitalize(), variable=self.mode_var,
                             value=mode, command=self.on_mode_change).pack(side=tk.LEFT)
-        self.page_label = ttk.Label(toolbar, text='')
-        self.page_label.pack(side=tk.LEFT, padx=10)
 
         main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True)
@@ -258,7 +314,10 @@ class PDFRedactorGUI:
             self.keywords_lb.insert(tk.END, kw)
         ent = ttk.Entry(parent)
         ent.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(parent, text='Add', command=lambda: self._add_listbox_item(ent, self.keywords_lb)).pack(pady=2)
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text='Add', command=lambda: self._add_listbox_item(ent, self.keywords_lb)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text='Delete', command=lambda: self._del_listbox_item(self.keywords_lb)).pack(side=tk.LEFT, padx=2)
 
         ttk.Label(parent, text='Passages:').pack(anchor='w', pady=(10,0))
         self.passages_txt = scrolledtext.ScrolledText(parent, height=8)
@@ -274,7 +333,10 @@ class PDFRedactorGUI:
             self.excl_lb.insert(tk.END, ex)
         ent = ttk.Entry(parent)
         ent.pack(fill=tk.X, padx=5, pady=5)
-        ttk.Button(parent, text='Add', command=lambda: self._add_listbox_item(ent, self.excl_lb)).pack(pady=2)
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text='Add', command=lambda: self._add_listbox_item(ent, self.excl_lb)).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text='Delete', command=lambda: self._del_listbox_item(self.excl_lb)).pack(side=tk.LEFT, padx=2)
         ttk.Button(parent, text='Save', command=self.save_exclusions).pack(pady=5)
 
     def _add_listbox_item(self, entry: ttk.Entry, listbox: tk.Listbox):
@@ -283,19 +345,55 @@ class PDFRedactorGUI:
             listbox.insert(tk.END, text)
             entry.delete(0, tk.END)
 
+    def _del_listbox_item(self, listbox: tk.Listbox):
+        sel = list(listbox.curselection())
+        for i in reversed(sel):
+            listbox.delete(i)
+
     def on_mode_change(self):
         self.current_tool = self.mode_var.get()
 
+    # --------------------- Navigation & Undo -------------------
+    def prev_page(self, *args):
+        if self.doc and self.current_page > 0:
+            self.current_page -= 1
+            self.display_page()
+
+    def next_page(self, *args):
+        if self.doc and self.current_page < len(self.doc)-1:
+            self.current_page += 1
+            self.display_page()
+
+    def undo(self, *args):
+        if self.region_store and self.region_store.undo():
+            self.display_page()
+
+    def redo(self, *args):
+        if self.region_store and self.region_store.redo():
+            self.display_page()
+
+    def save_regions(self):
+        if self.region_store:
+            self.region_store.save()
+            messagebox.showinfo('Saved', 'Regions saved', parent=self.root)
+
+    def show_help(self):
+        msg = ('Open a PDF then draw rectangles to redact or protect.\n'
+               'Use Prev/Next to change pages. Middle mouse pans.\n'
+               'Toggle Preview to see blacked out areas. Save Regions to store JSON files.')
+        messagebox.showinfo('Help', msg, parent=self.root)
+
     # --------------------- PDF Handling ------------------------
-    def open_pdf(self):
-        filename = filedialog.askopenfilename(filetypes=[('PDF files','*.pdf')])
+    def open_pdf(self, path=None):
+        filename = path or filedialog.askopenfilename(filetypes=[('PDF files','*.pdf')])
         if not filename:
             return
         self.doc = fitz.open(filename)
         self.current_page = 0
-        self.page_label.config(text=f"1 / {len(self.doc)}")
         stem = Path(filename).stem
-        self.region_store = RegionStore(stem)
+        self.region_store = RegionStore.load(stem)
+        self.page_label.config(text=f"1 / {len(self.doc)}")
+        self.last_pdf = filename
         self.display_page()
 
     def display_page(self):
@@ -304,7 +402,7 @@ class PDFRedactorGUI:
         p = self.doc[self.current_page]
         regs = self.region_store.regions.get(str(self.current_page), []) if self.region_store else []
         prot = self.region_store.protect.get(str(self.current_page), []) if self.region_store else []
-        self.canvas.display(p, regs, prot)
+        self.canvas.display(p, regs, prot, patterns=self.patterns, exclusions=self.exclusions, preview=self.preview_var.get())
         self.page_label.config(text=f"{self.current_page+1} / {len(self.doc)}")
 
     # drawing
@@ -390,6 +488,9 @@ def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str,list], p
 def run_gui():
     root = tk.Tk()
     app = PDFRedactorGUI(root)
+    root.protocol('WM_DELETE_WINDOW', lambda: (app.save_prefs(), root.destroy()))
+    if getattr(app, 'last_pdf', None) and Path(app.last_pdf).exists():
+        app.open_pdf(app.last_pdf)
     root.mainloop()
 
 
