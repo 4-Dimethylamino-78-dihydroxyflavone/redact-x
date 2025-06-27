@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -76,6 +77,7 @@ class RegionStore:
     protect: dict[str, list] = field(default_factory=dict)
     history: list = field(default_factory=list)
     future: list = field(default_factory=list)
+    last_autosave: float = 0.0
 
     MAX_HISTORY: int = 50
 
@@ -115,7 +117,11 @@ class RegionStore:
         self.protect = state['protect']
         return True
 
-    def autosave(self):
+    def autosave(self, force: bool = False):
+        now = time.time()
+        if not force and now - self.last_autosave < 5:
+            return
+        self.last_autosave = now
         path = JSONStore.DATA_DIR / f"{self.pdf_stem}_regions_autosave.json"
         JSONStore.write_atomic(path, {'regions': self.regions, 'protect': self.protect})
 
@@ -206,8 +212,15 @@ class PDFRedactorGUI:
         toolbar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(toolbar, text='Open PDF', command=self.open_pdf).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text='Save Redacted', command=self.save_redacted).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Undo', command=self.undo_action).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Redo', command=self.redo_action).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Prev', command=self.prev_page).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Next', command=self.next_page).pack(side=tk.LEFT, padx=5)
         self.page_label = ttk.Label(toolbar, text='')
         self.page_label.pack(side=tk.LEFT, padx=10)
+        self.current_tool = tk.StringVar(value='redact')
+        ttk.Radiobutton(toolbar, text='Redact', variable=self.current_tool, value='redact').pack(side=tk.RIGHT, padx=5)
+        ttk.Radiobutton(toolbar, text='Protect', variable=self.current_tool, value='protect').pack(side=tk.RIGHT, padx=5)
 
         main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True)
@@ -234,6 +247,12 @@ class PDFRedactorGUI:
         notebook.add(tab_exc, text='Exclusions')
         self.create_patterns_tab(tab_pats)
         self.create_exclusions_tab(tab_exc)
+
+        # keyboard shortcuts
+        self.root.bind('<Left>', self.prev_page)
+        self.root.bind('<Right>', self.next_page)
+        self.root.bind('<Control-z>', self.undo_action)
+        self.root.bind('<Control-y>', self.redo_action)
 
     def create_patterns_tab(self, parent):
         ttk.Label(parent, text='Keywords:').pack(anchor='w')
@@ -278,6 +297,11 @@ class PDFRedactorGUI:
         self.page_label.config(text=f"1 / {len(self.doc)}")
         stem = Path(filename).stem
         self.region_store = RegionStore(stem)
+        saved = JSONStore.find_latest_file(stem, 'regions')
+        if saved and saved.exists():
+            data = json.loads(saved.read_text())
+            self.region_store.regions = data.get('regions', {})
+            self.region_store.protect = data.get('protect', {})
         self.display_page()
 
     def display_page(self):
@@ -289,11 +313,34 @@ class PDFRedactorGUI:
         self.canvas.display(p, regs, prot)
         self.page_label.config(text=f"{self.current_page+1} / {len(self.doc)}")
 
+    def next_page(self, event=None):
+        if not self.doc:
+            return
+        if self.current_page < len(self.doc) - 1:
+            self.current_page += 1
+            self.display_page()
+
+    def prev_page(self, event=None):
+        if not self.doc:
+            return
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.display_page()
+
+    def undo_action(self, event=None):
+        if self.region_store and self.region_store.undo():
+            self.display_page()
+
+    def redo_action(self, event=None):
+        if self.region_store and self.region_store.redo():
+            self.display_page()
+
     # drawing
     def start_draw(self, event):
         self.start_x = self.canvas.canvasx(event.x)/self.canvas.scale
         self.start_y = self.canvas.canvasy(event.y)/self.canvas.scale
-        self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline='red')
+        color = 'green' if self.current_tool.get() == 'protect' else 'red'
+        self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=color)
 
     def update_draw(self, event):
         if hasattr(self, 'temp_rect'):
@@ -309,7 +356,7 @@ class PDFRedactorGUI:
             y2 = self.canvas.canvasy(event.y)/self.canvas.scale
             rect = [min(self.start_x,x2), min(self.start_y,y2), max(self.start_x,x2), max(self.start_y,y2)]
             if self.region_store:
-                self.region_store.add(self.current_page, rect)
+                self.region_store.add(self.current_page, rect, self.current_tool.get())
             self.canvas.delete(self.temp_rect)
             del self.temp_rect
             self.display_page()
@@ -380,6 +427,9 @@ def main():
     parser.add_argument('input', nargs='?', help='Input PDF for CLI mode')
     parser.add_argument('output', nargs='?', help='Output PDF for CLI mode')
     args = parser.parse_args()
+
+    if args.input and not args.output and not args.gui:
+        parser.error('output PDF required in CLI mode')
 
     if args.gui or not args.input:
         run_gui()
