@@ -178,6 +178,9 @@ class PDFRedactorGUI:
         self.current_page = 0
         self.region_store = None
 
+        # drawing mode state ("redact" or "protect")
+        self.current_tool = 'redact'
+
         self.patterns = {'keywords': [], 'passages': []}
         self.exclusions = []
         self.load_app_configs()
@@ -206,6 +209,11 @@ class PDFRedactorGUI:
         toolbar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(toolbar, text='Open PDF', command=self.open_pdf).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text='Save Redacted', command=self.save_redacted).pack(side=tk.LEFT, padx=5)
+        # drawing mode toggle
+        self.mode_var = tk.StringVar(value=self.current_tool)
+        for mode in ('redact', 'protect'):
+            ttk.Radiobutton(toolbar, text=mode.capitalize(), variable=self.mode_var,
+                            value=mode, command=self.on_mode_change).pack(side=tk.LEFT)
         self.page_label = ttk.Label(toolbar, text='')
         self.page_label.pack(side=tk.LEFT, padx=10)
 
@@ -268,6 +276,9 @@ class PDFRedactorGUI:
             listbox.insert(tk.END, text)
             entry.delete(0, tk.END)
 
+    def on_mode_change(self):
+        self.current_tool = self.mode_var.get()
+
     # --------------------- PDF Handling ------------------------
     def open_pdf(self):
         filename = filedialog.askopenfilename(filetypes=[('PDF files','*.pdf')])
@@ -293,7 +304,8 @@ class PDFRedactorGUI:
     def start_draw(self, event):
         self.start_x = self.canvas.canvasx(event.x)/self.canvas.scale
         self.start_y = self.canvas.canvasy(event.y)/self.canvas.scale
-        self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline='red')
+        color = 'red' if self.current_tool == 'redact' else 'green'
+        self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=color)
 
     def update_draw(self, event):
         if hasattr(self, 'temp_rect'):
@@ -309,7 +321,7 @@ class PDFRedactorGUI:
             y2 = self.canvas.canvasy(event.y)/self.canvas.scale
             rect = [min(self.start_x,x2), min(self.start_y,y2), max(self.start_x,x2), max(self.start_y,y2)]
             if self.region_store:
-                self.region_store.add(self.current_page, rect)
+                self.region_store.add(self.current_page, rect, kind=self.current_tool)
             self.canvas.delete(self.temp_rect)
             del self.temp_rect
             self.display_page()
