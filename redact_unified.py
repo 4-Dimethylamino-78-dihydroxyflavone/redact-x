@@ -184,6 +184,10 @@ class PDFRedactorGUI:
 
         self.setup_ui()
 
+        # keyboard shortcuts for undo/redo
+        self.root.bind('<Control-z>', self.undo_action)
+        self.root.bind('<Control-y>', self.redo_action)
+
     # --------------------- config handling --------------------
     def load_app_configs(self):
         pat = JSONStore.find_latest_file('app_wide', 'patterns')
@@ -206,6 +210,8 @@ class PDFRedactorGUI:
         toolbar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(toolbar, text='Open PDF', command=self.open_pdf).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text='Save Redacted', command=self.save_redacted).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Undo', command=self.undo_action).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Redo', command=self.redo_action).pack(side=tk.LEFT, padx=5)
         self.page_label = ttk.Label(toolbar, text='')
         self.page_label.pack(side=tk.LEFT, padx=10)
 
@@ -312,6 +318,15 @@ class PDFRedactorGUI:
                 self.region_store.add(self.current_page, rect)
             self.canvas.delete(self.temp_rect)
             del self.temp_rect
+            self.display_page()
+
+    # --------------------- Undo/Redo ---------------------------
+    def undo_action(self, event=None):
+        if self.region_store and self.region_store.undo():
+            self.display_page()
+
+    def redo_action(self, event=None):
+        if self.region_store and self.region_store.redo():
             self.display_page()
 
     # ------------------------- Save ----------------------------
