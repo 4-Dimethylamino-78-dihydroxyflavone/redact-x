@@ -400,6 +400,9 @@ def main():
     parser.add_argument('output', nargs='?', help='Output PDF for CLI mode')
     args = parser.parse_args()
 
+    if args.input and not args.output:
+        parser.error('output PDF required in CLI mode')
+
     if args.gui or not args.input:
         run_gui()
     else:
