@@ -13,6 +13,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
+import time
 from pathlib import Path
 
 import fitz  # PyMuPDF
@@ -76,6 +77,7 @@ class RegionStore:
     protect: dict[str, list] = field(default_factory=dict)
     history: list = field(default_factory=list)
     future: list = field(default_factory=list)
+    last_autosave: float = 0.0
 
     MAX_HISTORY: int = 50
 
@@ -115,9 +117,14 @@ class RegionStore:
         self.protect = state['protect']
         return True
 
-    def autosave(self):
-        path = JSONStore.DATA_DIR / f"{self.pdf_stem}_regions_autosave.json"
-        JSONStore.write_atomic(path, {'regions': self.regions, 'protect': self.protect})
+    def autosave(self, force: bool = False):
+        """Write regions to an autosave file if more than five seconds have
+        passed since the last save or when ``force`` is ``True``."""
+        now = time.time()
+        if force or now - self.last_autosave > 5:
+            path = JSONStore.DATA_DIR / f"{self.pdf_stem}_regions_autosave.json"
+            JSONStore.write_atomic(path, {'regions': self.regions, 'protect': self.protect})
+            self.last_autosave = now
 
     # load/save snapshot to timestamped files
     def save(self):
