@@ -278,6 +278,11 @@ class PDFRedactorGUI:
         self.page_label.config(text=f"1 / {len(self.doc)}")
         stem = Path(filename).stem
         self.region_store = RegionStore(stem)
+        latest = JSONStore.find_latest_file(stem, 'regions')
+        if latest and latest.exists():
+            data = json.loads(latest.read_text())
+            self.region_store.regions = data.get('regions', {})
+            self.region_store.protect = data.get('protect', {})
         self.display_page()
 
     def display_page(self):
