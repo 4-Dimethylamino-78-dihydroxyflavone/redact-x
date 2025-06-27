@@ -183,6 +183,7 @@ class PDFRedactorGUI:
         self.load_app_configs()
 
         self.setup_ui()
+        self.bind_shortcuts()
 
     # --------------------- config handling --------------------
     def load_app_configs(self):
@@ -206,8 +207,10 @@ class PDFRedactorGUI:
         toolbar.pack(side=tk.TOP, fill=tk.X)
         ttk.Button(toolbar, text='Open PDF', command=self.open_pdf).pack(side=tk.LEFT, padx=5)
         ttk.Button(toolbar, text='Save Redacted', command=self.save_redacted).pack(side=tk.LEFT, padx=5)
+        ttk.Button(toolbar, text='Prev', command=self.prev_page).pack(side=tk.LEFT, padx=5)
         self.page_label = ttk.Label(toolbar, text='')
         self.page_label.pack(side=tk.LEFT, padx=10)
+        ttk.Button(toolbar, text='Next', command=self.next_page).pack(side=tk.LEFT, padx=5)
 
         main = ttk.Frame(self.root)
         main.pack(fill=tk.BOTH, expand=True)
@@ -234,6 +237,10 @@ class PDFRedactorGUI:
         notebook.add(tab_exc, text='Exclusions')
         self.create_patterns_tab(tab_pats)
         self.create_exclusions_tab(tab_exc)
+
+    def bind_shortcuts(self):
+        self.root.bind('<Prior>', self.prev_page)
+        self.root.bind('<Next>', self.next_page)
 
     def create_patterns_tab(self, parent):
         ttk.Label(parent, text='Keywords:').pack(anchor='w')
@@ -279,6 +286,16 @@ class PDFRedactorGUI:
         stem = Path(filename).stem
         self.region_store = RegionStore(stem)
         self.display_page()
+
+    def prev_page(self, event=None):
+        if self.doc and self.current_page > 0:
+            self.current_page -= 1
+            self.display_page()
+
+    def next_page(self, event=None):
+        if self.doc and self.current_page < len(self.doc) - 1:
+            self.current_page += 1
+            self.display_page()
 
     def display_page(self):
         if not self.doc:
