@@ -6,9 +6,17 @@
 
 - Interactive GUI built with Tkinter to mark rectangular areas for redaction
 - Support for lists of keyword and passage patterns to automatically search and redact text
-- Exclusion list to prevent redaction of matching strings
+- Exclusion list (keywords and passages) to prevent redaction of matching strings
 - Autosaves region selections and configurations to timestamped JSON files
+- Resizable panes with zoomable PDF viewer
 - Command-line interface to apply saved settings without launching the GUI
+
+### Patterns vs Exclusions
+
+Patterns define text you want to redact. Exclusions hold keywords or passages
+that should never be removed. When both match, the exclusion wins so the text
+is preserved. Use protected regions to completely block pattern matches within
+those areas.
 
 ## Installation
 
@@ -35,6 +43,14 @@ python redact_unified.py --gui
 ```
 
 Use the GUI to open a PDF, draw boxes over regions to redact, manage keywords and passage lists, then choose **Save Redacted** to export a new PDF.
+
+### Controls
+
+- **Space**: pan around the PDF
+- **T**: text selection tool
+- **R/P**: draw redaction or protection rectangles
+- **Ctrl+Mouse Wheel** or **Ctrl+ +/-**: zoom in and out (Ctrl+0 resets)
+- **Ctrl+Z/Ctrl+Y**: undo/redo region changes
 
 ### Command line
 
