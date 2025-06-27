@@ -12,6 +12,9 @@
 - Pane sizes are remembered between sessions
 - Preview updates live as you edit patterns or exclusions
 - Command-line interface to apply saved settings without launching the GUI
+- Right-click an existing region to delete it or toggle between redaction and
+  protection
+- Global keyboard shortcuts (Ctrl+Z/Ctrl+Y) work regardless of focus
 
 ### Patterns vs Exclusions
 
