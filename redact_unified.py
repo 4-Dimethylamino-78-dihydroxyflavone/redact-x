@@ -99,6 +99,18 @@ class RegionStore:
             self.regions.setdefault(str(page), []).append(bbox)
         self.autosave()
 
+    def remove(self, page: int, index: int, kind: str = 'redact') -> bool:
+        """Remove a region by page and index."""
+        self._snapshot()
+        key = str(page)
+        items = self.protect if kind == 'protect' else self.regions
+        arr = items.get(key, [])
+        if 0 <= index < len(arr):
+            arr.pop(index)
+            self.autosave(force=True)
+            return True
+        return False
+
     def undo(self):
         if not self.history:
             return False
@@ -454,6 +466,58 @@ class PDFRedactorGUI:
 
 
 # ---------------------------------------------------------------------------
+# CLI helpers for configs
+# ---------------------------------------------------------------------------
+def load_patterns(path: str | None = None) -> dict:
+    if path:
+        p = Path(path)
+        if p.exists():
+            return json.loads(p.read_text())
+        return {'keywords': [], 'passages': []}
+    pat = JSONStore.find_latest_file('app_wide', 'patterns')
+    if pat and pat.exists():
+        return json.loads(pat.read_text())
+    return {'keywords': [], 'passages': []}
+
+
+def save_patterns(data: dict, path: str | None = None):
+    if path:
+        JSONStore.write_atomic(Path(path), data)
+    else:
+        fn = JSONStore.get_timestamped_filename('app_wide', 'patterns')
+        JSONStore.write_atomic(fn, data)
+
+
+def load_exclusions(path: str | None = None) -> list:
+    if path:
+        p = Path(path)
+        if p.exists():
+            return json.loads(p.read_text())
+        return []
+    exc = JSONStore.find_latest_file('app_wide', 'exclusions')
+    if exc and exc.exists():
+        return json.loads(exc.read_text())
+    return []
+
+
+def save_exclusions(data: list, path: str | None = None):
+    if path:
+        JSONStore.write_atomic(Path(path), data)
+    else:
+        fn = JSONStore.get_timestamped_filename('app_wide', 'exclusions')
+        JSONStore.write_atomic(fn, data)
+
+
+def load_region_store(pdf: str) -> RegionStore:
+    stem = Path(pdf).stem
+    return RegionStore.load(stem)
+
+
+def print_json(data):
+    print(json.dumps(data, indent=2))
+
+
+# ---------------------------------------------------------------------------
 # Core redaction logic (headless)
 # ---------------------------------------------------------------------------
 def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str,list], patterns: dict, exclusions: list):
@@ -497,34 +561,156 @@ def run_gui():
 def main():
     parser = argparse.ArgumentParser(description='Unified PDF redactor')
     parser.add_argument('--gui', action='store_true', help='Launch GUI')
-    parser.add_argument('input', nargs='?', help='Input PDF for CLI mode')
-    parser.add_argument('output', nargs='?', help='Output PDF for CLI mode')
+    parser.add_argument('input', nargs='?', help='Input PDF for CLI apply mode')
+    parser.add_argument('output', nargs='?', help='Output PDF for CLI apply mode')
     parser.add_argument('--patterns', help='Path to JSON patterns file')
     parser.add_argument('--exclusions', help='Path to JSON exclusions file')
     parser.add_argument('--regions', help='Path to JSON region file')
+    parser.add_argument('--apply', action='store_true', help='Apply redactions (default when input and output provided)')
+    parser.add_argument('--list-patterns', action='store_true', help='List saved patterns')
+    parser.add_argument('--add-pattern', nargs=2, metavar=('TYPE','TEXT'), help='Add a keyword or passage pattern')
+    parser.add_argument('--remove-pattern', nargs=2, metavar=('TYPE','TEXT'), help='Remove a keyword or passage pattern')
+    parser.add_argument('--list-exclusions', action='store_true', help='List saved exclusions')
+    parser.add_argument('--add-exclusion', metavar='TEXT', help='Add an exclusion string')
+    parser.add_argument('--remove-exclusion', metavar='TEXT', help='Remove an exclusion string')
+    parser.add_argument('--list-regions', nargs='?', const='ALL', metavar='PAGE', help='List regions for PDF (use --input to specify pdf)')
+    parser.add_argument('--add-region', nargs=5, metavar=('PAGE','X1','Y1','X2','Y2'), help='Add region box to PDF')
+    parser.add_argument('--remove-region', nargs=2, metavar=('PAGE','INDEX'), help='Remove region by page and index')
+    parser.add_argument('--undo-region', action='store_true', help='Undo last region edit')
+    parser.add_argument('--redo-region', action='store_true', help='Redo last undone region edit')
+    parser.add_argument('--region-type', choices=['redact','protect'], default='redact', help='Type for --add-region/remove-region')
     args = parser.parse_args()
 
-    if args.input and not args.output:
+    ops = [args.list_patterns, args.add_pattern, args.remove_pattern,
+           args.list_exclusions, args.add_exclusion, args.remove_exclusion,
+           args.list_regions != None, args.add_region, args.remove_region,
+           args.undo_region, args.redo_region]
+
+    if args.input and not args.output and not any(ops) and not args.apply:
         parser.error('output PDF required in CLI mode')
 
-    if args.gui or not args.input:
+    if args.gui or (not args.input and not any(ops) and not args.apply):
         run_gui()
-    else:
-        patterns_path = Path(args.patterns) if args.patterns else JSONStore.find_latest_file('app_wide', 'patterns')
-        exclusions_path = Path(args.exclusions) if args.exclusions else JSONStore.find_latest_file('app_wide', 'exclusions')
-        patterns = json.loads(patterns_path.read_text()) if patterns_path and patterns_path.exists() else {'keywords': [], 'passages': []}
-        exclusions = json.loads(exclusions_path.read_text()) if exclusions_path and exclusions_path.exists() else []
-        regions = {}
+        return
+
+    # pattern operations
+    if args.list_patterns:
+        pats = load_patterns(args.patterns)
+        print_json(pats)
+        return
+    if args.add_pattern:
+        kind, text = args.add_pattern
+        if kind not in ('keyword','passage'):
+            parser.error('pattern type must be keyword or passage')
+        pats = load_patterns(args.patterns)
+        key = 'keywords' if kind == 'keyword' else 'passages'
+        if text in pats.get(key, []):
+            parser.error('pattern already exists')
+        pats.setdefault(key, []).append(text)
+        save_patterns(pats, args.patterns)
+        print('Pattern added')
+        return
+    if args.remove_pattern:
+        kind, text = args.remove_pattern
+        if kind not in ('keyword','passage'):
+            parser.error('pattern type must be keyword or passage')
+        pats = load_patterns(args.patterns)
+        key = 'keywords' if kind == 'keyword' else 'passages'
+        try:
+            pats[key].remove(text)
+        except (KeyError, ValueError):
+            parser.error('pattern not found')
+        save_patterns(pats, args.patterns)
+        print('Pattern removed')
+        return
+
+    # exclusion operations
+    if args.list_exclusions:
+        exc = load_exclusions(args.exclusions)
+        print_json(exc)
+        return
+    if args.add_exclusion:
+        exc = load_exclusions(args.exclusions)
+        if args.add_exclusion in exc:
+            parser.error('exclusion already exists')
+        exc.append(args.add_exclusion)
+        save_exclusions(exc, args.exclusions)
+        print('Exclusion added')
+        return
+    if args.remove_exclusion:
+        exc = load_exclusions(args.exclusions)
+        try:
+            exc.remove(args.remove_exclusion)
+        except ValueError:
+            parser.error('exclusion not found')
+        save_exclusions(exc, args.exclusions)
+        print('Exclusion removed')
+        return
+
+    # region operations require input PDF
+    if args.list_regions is not None or args.add_region or args.remove_region or args.undo_region or args.redo_region:
+        if not args.input:
+            parser.error('input PDF required for region operations')
+        store = load_region_store(args.input)
+        if args.list_regions is not None:
+            page = args.list_regions
+            if page == 'ALL':
+                print_json({'regions': store.regions, 'protect': store.protect})
+            else:
+                page_regions = store.regions.get(str(page), [])
+                page_prot = store.protect.get(str(page), [])
+                print_json({'regions': page_regions, 'protect': page_prot})
+            return
+        if args.add_region:
+            page,x1,y1,x2,y2 = args.add_region
+            store.add(int(page), [float(x1),float(y1),float(x2),float(y2)], kind=args.region_type)
+            store.save()
+            print('Region added')
+            return
+        if args.remove_region:
+            page, idx = args.remove_region
+            ok = store.remove(int(page), int(idx), kind=args.region_type)
+            if not ok:
+                parser.error('no region at that index')
+            store.save()
+            print('Region removed')
+            return
+        if args.undo_region:
+            if not store.undo():
+                parser.error('nothing to undo')
+            store.save()
+            print('Undo done')
+            return
+        if args.redo_region:
+            if not store.redo():
+                parser.error('nothing to redo')
+            store.save()
+            print('Redo done')
+            return
+
+    # apply redactions
+    if args.apply or (args.input and args.output):
+        input_pdf = args.input if args.input else args.apply[0] if isinstance(args.apply, list) else None
+        output_pdf = args.output if args.output else args.apply[1] if isinstance(args.apply, list) else None
+        if not input_pdf or not output_pdf:
+            parser.error('input and output required for apply')
+        patterns = load_patterns(args.patterns)
+        exclusions = load_exclusions(args.exclusions)
         if args.regions:
             region_file = Path(args.regions)
+            if region_file.exists():
+                data = json.loads(region_file.read_text())
+                regions = data.get('regions', {})
+            else:
+                regions = {}
         else:
-            stem = Path(args.input).stem
-            region_file = JSONStore.DATA_DIR / f"{stem}_regions_autosave.json"
-        if region_file.exists():
-            data = json.loads(region_file.read_text())
-            regions = data.get('regions', {})
-        apply_redactions(args.input, args.output, regions, patterns, exclusions)
-        print(f"Saved to {args.output}")
+            store = load_region_store(input_pdf)
+            regions = store.regions
+        apply_redactions(input_pdf, output_pdf, regions, patterns, exclusions)
+        print(f'Saved to {output_pdf}')
+        return
+
+    parser.print_help()
 
 
 if __name__ == '__main__':
