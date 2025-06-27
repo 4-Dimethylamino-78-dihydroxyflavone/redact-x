@@ -1017,20 +1017,6 @@ class PDFRedactorGUI:
 
     def on_mousewheel(self, event):
         """Handle mouse wheel scrolling"""
-        # Zoom when Control is held
-        if event.state & 0x0004:
-            if event.delta:
-                if event.delta > 0:
-                    self.zoom_in()
-                else:
-                    self.zoom_out()
-            else:
-                if event.num == 4:
-                    self.zoom_in()
-                elif event.num == 5:
-                    self.zoom_out()
-            return
-
         # Horizontal scrolling when Shift is held or tilt wheel
         if event.state & 0x0001 or getattr(event, 'num', None) in (6, 7):
             if event.delta:
