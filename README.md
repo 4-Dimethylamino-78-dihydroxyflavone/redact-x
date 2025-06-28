@@ -1,4 +1,4 @@
-# PDF Redactor X - Enhanced Edition
+# PDF Redactor X - 2025-06-28-1342
 
 `redact_unified.py` provides both a graphical and command-line interface for redacting PDF files. This enhanced version includes OCR support for scanned PDFs, preset workflows, improved zoom controls, and comprehensive testing.
 
@@ -29,6 +29,9 @@
 - **Standalone Executable**: Build script for creating distributable executables
 - **Comprehensive Testing**: Extended unit test coverage for all components
 
+### Needed Features
+- **Flexible Polygon**: Beyond the square drawing functionality a more dynamic redaction option must be employed through perhaps some...additional button beyond Draw Rectangle (R/P) like Draw Polygon (R/P) that allows a kind of point and click unlimited vericies that can form unusual stretches of redaction for the most atypical pdfs.
+  
 ### Patterns vs Exclusions
 
 Patterns define text you want to redact. Exclusions hold keywords or passages that should never be removed. When both match, the exclusion wins so the text is preserved. Use protected regions to completely block pattern matches within those areas.
