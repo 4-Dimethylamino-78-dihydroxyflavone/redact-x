@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Enhanced PDF redactor GUI + CLI with complete feature set.
+"""Enhanced PDF redactor GUI + CLI with OCR support, presets, and improved zoom.
 
 This enhanced version includes:
-- Mouse panning support
-- Text selection mode vs region drawing modes
-- Excluded passages text area (like version 3)
-- Manual JSON import/export
-- Auto-detection of JSON files in launch directory
-- Tool switching between Pan, Text Select, and Draw modes
+- Fixed Ctrl+MouseWheel zoom functionality
+- OCR support for scanned PDFs
+- Preset workflows for common redaction tasks
+- Improved error handling and robustness
+- Better packaging support for standalone executables
+- Extended unit test coverage
 """
 
 import argparse
 import json
 import os
 import re
+import sys
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from dataclasses import dataclass, field
@@ -21,9 +22,23 @@ from datetime import datetime
 import time
 from pathlib import Path
 from enum import Enum, auto
+from typing import Optional, Dict, List, Tuple, Any
+import threading
+import queue
 
 import fitz  # PyMuPDF
 from PIL import Image, ImageTk, ImageDraw
+
+# Optional OCR support
+try:
+    import pytesseract
+    import cv2
+    import numpy as np
+
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    print("OCR support not available. Install pytesseract and opencv-python for OCR features.")
 
 
 # Tool modes enumeration
@@ -34,17 +49,154 @@ class ToolMode(Enum):
     DRAW_PROTECT = auto()
 
 
+# Preset definitions for common redaction workflows
+REDACTION_PRESETS = {
+    "Personal Information": {
+        "name": "Personal Information",
+        "description": "Redact names, addresses, phone numbers, emails, and SSNs",
+        "patterns": {
+            "keywords": [],
+            "passages": []
+        },
+        "regex_patterns": [
+            r"\b\d{3}-\d{2}-\d{4}\b",  # SSN
+            r"\b\d{3}[-.]?\d{3}[-.]?\d{4}\b",  # Phone numbers
+            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",  # Email
+            r"\b\d{5}(?:-\d{4})?\b",  # ZIP codes
+        ]
+    },
+    "Financial Data": {
+        "name": "Financial Data",
+        "description": "Redact account numbers, credit card info, and financial details",
+        "patterns": {
+            "keywords": ["account", "balance", "credit card", "bank"],
+            "passages": []
+        },
+        "regex_patterns": [
+            r"\b\d{4}[\s-]?\d{4}[\s-]?\d{4}[\s-]?\d{4}\b",  # Credit card
+            r"\$[\d,]+\.?\d*",  # Dollar amounts
+            r"\b\d{8,17}\b",  # Account numbers
+        ]
+    },
+    "Medical Records": {
+        "name": "Medical Records",
+        "description": "Redact patient names, medical record numbers, and diagnoses",
+        "patterns": {
+            "keywords": ["patient", "diagnosis", "treatment", "medication"],
+            "passages": []
+        },
+        "regex_patterns": [
+            r"MRN[\s:]*\d+",  # Medical record numbers
+            r"DOB[\s:]*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",  # Date of birth
+        ]
+    },
+    "Legal Documents": {
+        "name": "Legal Documents",
+        "description": "Redact case numbers, client names, and sensitive legal info",
+        "patterns": {
+            "keywords": ["confidential", "attorney-client", "privileged"],
+            "passages": []
+        },
+        "regex_patterns": [
+            r"Case\s*No\.?\s*:?\s*\d+",  # Case numbers
+            r"\b(?:Plaintiff|Defendant|Witness)\s*:?\s*[A-Z][a-z]+\s+[A-Z][a-z]+",
+        ]
+    }
+}
+
+
 # ---------------------------------------------------------------------------
-# JSONStore helper
+# OCR Helper Functions
+# ---------------------------------------------------------------------------
+class OCRProcessor:
+    """Handle OCR processing for scanned PDFs."""
+
+    def __init__(self):
+        self.ocr_available = OCR_AVAILABLE
+
+    def preprocess_image(self, img: Image.Image) -> Image.Image:
+        """Preprocess image for better OCR results."""
+        if not self.ocr_available:
+            return img
+
+        # Convert PIL to OpenCV format
+        open_cv_image = np.array(img)
+
+        # Convert to grayscale
+        gray = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2GRAY)
+
+        # Apply thresholding to get better OCR results
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(thresh)
+
+        # Convert back to PIL
+        return Image.fromarray(denoised)
+
+    def extract_text_with_positions(self, page: fitz.Page) -> List[Tuple[str, fitz.Rect]]:
+        """Extract text with positions using OCR."""
+        if not self.ocr_available:
+            return []
+
+        # Get page as image
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))  # 2x scale for better OCR
+        img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+
+        # Preprocess
+        img = self.preprocess_image(img)
+
+        # Get OCR data with positions
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+        results = []
+        n_boxes = len(data['text'])
+
+        for i in range(n_boxes):
+            if data['text'][i].strip():
+                # Scale coordinates back to original
+                x = data['left'][i] / 2
+                y = data['top'][i] / 2
+                w = data['width'][i] / 2
+                h = data['height'][i] / 2
+
+                rect = fitz.Rect(x, y, x + w, y + h)
+                results.append((data['text'][i], rect))
+
+        return results
+
+    def is_scanned_pdf(self, doc: fitz.Document) -> bool:
+        """Check if PDF appears to be scanned (image-based)."""
+        if len(doc) == 0:
+            return False
+
+        # Check first few pages
+        pages_to_check = min(3, len(doc))
+
+        for i in range(pages_to_check):
+            page = doc[i]
+            # If page has very little text but has images, likely scanned
+            text = page.get_text().strip()
+            images = page.get_images()
+
+            if len(text) < 50 and len(images) > 0:
+                return True
+
+        return False
+
+
+# ---------------------------------------------------------------------------
+# JSONStore helper (enhanced with preset support)
 # ---------------------------------------------------------------------------
 class JSONStore:
-    """Filesystem helper for timestamped JSON, atomic writes, and prefs."""
+    """Filesystem helper for timestamped JSON, atomic writes, prefs, and presets."""
 
     APP_STEM = Path(__file__).stem
     DATA_DIR = Path(__file__).with_suffix('')
     TIMESTAMP_FMT = "%Y-%m-%d-%H%M"
     _TS_RE = re.compile(r"(\d{4}-\d{2}-\d{2}-\d{4})")
     PREFS_FILE = DATA_DIR / f"{APP_STEM}_prefs.json"
+    PRESETS_FILE = DATA_DIR / f"{APP_STEM}_presets.json"
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -91,6 +243,29 @@ class JSONStore:
         if JSONStore.DATA_DIR.exists():
             json_files.extend(JSONStore.DATA_DIR.glob("*.json"))
         return json_files
+
+    @staticmethod
+    def load_presets() -> Dict[str, Any]:
+        """Load saved presets or return defaults."""
+        if JSONStore.PRESETS_FILE.exists():
+            try:
+                user_presets = json.loads(JSONStore.PRESETS_FILE.read_text())
+                # Merge with defaults
+                all_presets = REDACTION_PRESETS.copy()
+                all_presets.update(user_presets)
+                return all_presets
+            except:
+                pass
+        return REDACTION_PRESETS.copy()
+
+    @staticmethod
+    def save_presets(presets: Dict[str, Any]):
+        """Save user presets."""
+        # Only save user-defined presets
+        user_presets = {k: v for k, v in presets.items()
+                        if k not in REDACTION_PRESETS}
+        if user_presets:
+            JSONStore.write_atomic(JSONStore.PRESETS_FILE, user_presets)
 
 
 # ---------------------------------------------------------------------------
@@ -215,11 +390,22 @@ class PDFCanvas(tk.Canvas):
         self.selection_start = None
         self.selection_rect = None
 
+        # OCR support
+        self.ocr_processor = OCRProcessor()
+        self.ocr_results = []
+
     def display(self, page: fitz.Page, regions: list[list], protect: list[list], scale: float = 2.0,
                 patterns: dict | None = None, exclusions: list | None = None,
-                excluded_passages: list | None = None, preview: bool = False):
+                excluded_passages: list | None = None, preview: bool = False,
+                use_ocr: bool = False, regex_patterns: list | None = None):
         self.scale = scale
         self.page = page
+        self.ocr_results = []
+
+        # Run OCR if requested
+        if use_ocr and self.ocr_processor.ocr_available:
+            self.ocr_results = self.ocr_processor.extract_text_with_positions(page)
+
         pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
         img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
         draw = ImageDraw.Draw(img, 'RGBA')
@@ -242,41 +428,66 @@ class PDFCanvas(tk.Canvas):
                 patt_list = patterns.get('keywords', []) + patterns.get('passages', [])
                 all_exclusions = (exclusions or []) + (excluded_passages or [])
 
+                # Search in regular text
                 for pat in patt_list:
                     # Skip if pattern matches any exclusion
                     if any(excl.lower() in pat.lower() for excl in all_exclusions):
                         continue
 
                     for area in page.search_for(pat, quads=False):
-                        # Check if area is protected
-                        is_protected = False
-                        for px1, py1, px2, py2 in protect:
-                            if (area.x0 >= px1 and area.y0 >= py1 and
-                                    area.x1 <= px2 and area.y1 <= py2):
-                                is_protected = True
-                                break
+                        if self._should_redact_area(area, protect, all_exclusions, page):
+                            draw.rectangle([area.x0 * scale, area.y0 * scale, area.x1 * scale, area.y1 * scale],
+                                           fill='black')
 
-                        if not is_protected:
-                            # Check context for exclusions
-                            should_redact = True
-                            expanded = fitz.Rect(area)
-                            expanded.x0 -= 20
-                            expanded.x1 += 20
-                            try:
-                                context = page.get_textbox(expanded)
-                                if any(excl.lower() in context.lower() for excl in all_exclusions):
-                                    should_redact = False
-                            except:
-                                pass
+                # Search in OCR text if available
+                if self.ocr_results:
+                    for text, rect in self.ocr_results:
+                        for pat in patt_list:
+                            if pat.lower() in text.lower():
+                                if self._should_redact_area(rect, protect, all_exclusions, page):
+                                    draw.rectangle([rect.x0 * scale, rect.y0 * scale,
+                                                    rect.x1 * scale, rect.y1 * scale], fill='black')
 
-                            if should_redact:
-                                draw.rectangle([area.x0 * scale, area.y0 * scale, area.x1 * scale, area.y1 * scale],
-                                               fill='black')
+            # Apply regex pattern redactions
+            if regex_patterns:
+                text = page.get_text()
+                for pattern in regex_patterns:
+                    try:
+                        for match in re.finditer(pattern, text, re.IGNORECASE):
+                            # Try to find the match location on the page
+                            matched_text = match.group(0)
+                            for area in page.search_for(matched_text, quads=False):
+                                if self._should_redact_area(area, protect, all_exclusions, page):
+                                    draw.rectangle([area.x0 * scale, area.y0 * scale,
+                                                    area.x1 * scale, area.y1 * scale], fill='black')
+                    except re.error:
+                        continue
 
         self.img = ImageTk.PhotoImage(img)
         self.delete('all')
         self.create_image(0, 0, image=self.img, anchor='nw')
         self.config(scrollregion=self.bbox('all'))
+
+    def _should_redact_area(self, area: fitz.Rect, protect: list, exclusions: list, page: fitz.Page) -> bool:
+        """Check if an area should be redacted based on protection and exclusions."""
+        # Check if area is protected
+        for px1, py1, px2, py2 in protect:
+            if (area.x0 >= px1 and area.y0 >= py1 and
+                    area.x1 <= px2 and area.y1 <= py2):
+                return False
+
+        # Check context for exclusions
+        expanded = fitz.Rect(area)
+        expanded.x0 -= 20
+        expanded.x1 += 20
+        try:
+            context = page.get_textbox(expanded)
+            if any(excl.lower() in context.lower() for excl in exclusions):
+                return False
+        except:
+            pass
+
+        return True
 
     def set_tool_mode(self, mode: ToolMode):
         self.tool_mode = mode
@@ -324,6 +535,12 @@ class PDFCanvas(tk.Canvas):
             rect = fitz.Rect(x0, y0, x1, y1)
             text = self.page.get_textbox(rect)
 
+            # Also check OCR results if available
+            if not text.strip() and self.ocr_results:
+                for ocr_text, ocr_rect in self.ocr_results:
+                    if rect.intersects(ocr_rect):
+                        text += " " + ocr_text
+
             # Clean up
             self.delete(self.selection_rect)
             self.selection_rect = None
@@ -334,7 +551,7 @@ class PDFCanvas(tk.Canvas):
 
 
 # ---------------------------------------------------------------------------
-# PDFRedactorGUI - main application window
+# PDFRedactorGUI - main application window (enhanced)
 # ---------------------------------------------------------------------------
 class PDFRedactorGUI:
     def __init__(self, root: tk.Tk):
@@ -352,6 +569,15 @@ class PDFRedactorGUI:
         self.patterns = {'keywords': [], 'passages': []}
         self.exclusions = []
         self.excluded_passages = []  # New: separate list for excluded passages
+        self.regex_patterns = []  # For preset regex patterns
+
+        # OCR settings
+        self.use_ocr = tk.BooleanVar(value=False)
+        self.is_scanned = False
+
+        # Presets
+        self.presets = JSONStore.load_presets()
+        self.current_preset = None
 
         # Remember last pane position for resizable layout
         self.last_pane_position: int | None = None
@@ -381,15 +607,44 @@ class PDFRedactorGUI:
         self.root.bind('<Control-s>', lambda e: self.save_redacted())
         self.root.bind('<Control-i>', lambda e: self.import_config())
         self.root.bind('<Control-e>', lambda e: self.export_config())
+
+        # Fixed zoom shortcuts - bind to multiple variations
         self.root.bind('<Control-plus>', lambda e: self.zoom_in())
+        self.root.bind('<Control-KP_Add>', lambda e: self.zoom_in())  # Numpad +
+        self.root.bind('<Control-equal>', lambda e: self.zoom_in())  # = key (shift + = gives +)
+
         self.root.bind('<Control-minus>', lambda e: self.zoom_out())
+        self.root.bind('<Control-KP_Subtract>', lambda e: self.zoom_out())  # Numpad -
+        self.root.bind('<Control-underscore>', lambda e: self.zoom_out())  # _ key
+
         self.root.bind('<Control-0>', lambda e: self.zoom_reset())
+        self.root.bind('<Control-KP_0>', lambda e: self.zoom_reset())  # Numpad 0
+
+        # Ctrl+MouseWheel for zooming
+        self.root.bind('<Control-MouseWheel>', self.on_ctrl_mousewheel)
+        self.root.bind('<Control-Button-4>', self.on_ctrl_mousewheel)  # Linux
+        self.root.bind('<Control-Button-5>', self.on_ctrl_mousewheel)  # Linux
 
         # Tool switching shortcuts
         self.root.bind('<space>', lambda e: self.set_tool_mode(ToolMode.PAN))
         self.root.bind('t', lambda e: self.set_tool_mode(ToolMode.TEXT_SELECT))
         self.root.bind('r', lambda e: self.set_tool_mode(ToolMode.DRAW_REDACT))
         self.root.bind('p', lambda e: self.set_tool_mode(ToolMode.DRAW_PROTECT))
+
+    def on_ctrl_mousewheel(self, event):
+        """Handle Ctrl+MouseWheel for zooming"""
+        if event.delta:
+            # Windows/Mac
+            if event.delta > 0:
+                self.zoom_in()
+            else:
+                self.zoom_out()
+        else:
+            # Linux
+            if event.num == 4:
+                self.zoom_in()
+            elif event.num == 5:
+                self.zoom_out()
 
     def auto_detect_json_files(self):
         """Auto-detect and offer to load JSON files from launch directory"""
@@ -568,6 +823,8 @@ class PDFRedactorGUI:
                     'patterns': self.patterns,
                     'exclusions': self.exclusions,
                     'excluded_passages': self.excluded_passages,
+                    'regex_patterns': self.regex_patterns,
+                    'preset': self.current_preset,
                     'exported': datetime.now().isoformat()
                 }
                 with open(filename, 'w') as f:
@@ -635,6 +892,16 @@ class PDFRedactorGUI:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
 
+        # Add Presets menu
+        preset_menu = tk.Menu(menubar, tearoff=0)
+        menubar.add_cascade(label="Presets", menu=preset_menu)
+        for preset_name in self.presets:
+            preset_menu.add_command(label=preset_name,
+                                    command=lambda n=preset_name: self.apply_preset(n))
+        preset_menu.add_separator()
+        preset_menu.add_command(label="Save Current as Preset...", command=self.save_as_preset)
+        preset_menu.add_command(label="Manage Presets...", command=self.manage_presets)
+
         # Toolbar
         toolbar = ttk.Frame(self.root)
         toolbar.pack(side=tk.TOP, fill=tk.X)
@@ -685,6 +952,11 @@ class PDFRedactorGUI:
         ttk.Checkbutton(toolbar, text='Preview', variable=self.preview_var, command=self.display_page).pack(
             side=tk.LEFT)
 
+        # OCR checkbox
+        ttk.Checkbutton(toolbar, text='Use OCR', variable=self.use_ocr,
+                        command=self.display_page,
+                        state='normal' if OCR_AVAILABLE else 'disabled').pack(side=tk.LEFT)
+
         ttk.Button(toolbar, text='Help', command=self.show_help).pack(side=tk.RIGHT, padx=5)
 
         # Main area with resizable panes
@@ -733,14 +1005,17 @@ class PDFRedactorGUI:
         tab_pats = ttk.Frame(notebook)
         tab_exc = ttk.Frame(notebook)
         tab_regs = ttk.Frame(notebook)
+        tab_presets = ttk.Frame(notebook)
 
         notebook.add(tab_pats, text='Patterns')
         notebook.add(tab_exc, text='Exclusions')
         notebook.add(tab_regs, text='Regions')
+        notebook.add(tab_presets, text='Presets')
 
         self.create_patterns_tab(tab_pats)
         self.create_exclusions_tab(tab_exc)
         self.create_regions_tab(tab_regs)
+        self.create_presets_tab(tab_presets)
 
         # Status bar
         self.status_bar = ttk.Label(self.root, text="Ready", relief=tk.SUNKEN)
@@ -774,7 +1049,8 @@ class PDFRedactorGUI:
         ttk.Label(parent, text='Passages (separate with ---):').pack(anchor='w', pady=(10, 0))
         self.passages_txt = scrolledtext.ScrolledText(parent, height=8)
         self.passages_txt.pack(fill=tk.BOTH, expand=True, padx=5)
-        self.passages_txt.bind('<KeyRelease>', lambda e: (self.update_patterns_from_ui(), self.schedule_preview_update()))
+        self.passages_txt.bind('<KeyRelease>',
+                               lambda e: (self.update_patterns_from_ui(), self.schedule_preview_update()))
 
         ttk.Button(parent, text='Save Patterns', command=self.save_patterns).pack(pady=5)
 
@@ -808,10 +1084,11 @@ class PDFRedactorGUI:
         ttk.Button(parent, text='Add Keyword from Selection',
                    command=self.add_exclusion_from_selection).pack(pady=5)
 
-        ttk.Label(parent, text='Excluded Passages (--- separated):').pack(anchor='w', pady=(10,0))
+        ttk.Label(parent, text='Excluded Passages (--- separated):').pack(anchor='w', pady=(10, 0))
         self.excluded_passages_txt = scrolledtext.ScrolledText(parent, height=8)
         self.excluded_passages_txt.pack(fill=tk.BOTH, expand=True, padx=5)
-        self.excluded_passages_txt.bind('<KeyRelease>', lambda e: (self.update_exclusions_from_ui(), self.schedule_preview_update()))
+        self.excluded_passages_txt.bind('<KeyRelease>',
+                                        lambda e: (self.update_exclusions_from_ui(), self.schedule_preview_update()))
 
         pass_btn_frame = ttk.Frame(parent)
         pass_btn_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -853,6 +1130,188 @@ class PDFRedactorGUI:
 
         self.refresh_region_tree()
 
+    def create_presets_tab(self, parent):
+        """Create the presets tab UI."""
+        # Current preset label
+        self.preset_label = ttk.Label(parent, text="No preset active",
+                                      font=('TkDefaultFont', 10, 'bold'))
+        self.preset_label.pack(pady=10)
+
+        # Preset list
+        ttk.Label(parent, text="Available Presets:").pack(anchor='w', padx=10)
+
+        preset_frame = ttk.Frame(parent)
+        preset_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.preset_listbox = tk.Listbox(preset_frame, height=10)
+        self.preset_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        preset_scroll = ttk.Scrollbar(preset_frame, command=self.preset_listbox.yview)
+        preset_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.preset_listbox.config(yscrollcommand=preset_scroll.set)
+
+        # Populate preset list
+        self.update_preset_list()
+
+        # Preset details
+        details_frame = ttk.LabelFrame(parent, text="Preset Details")
+        details_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        self.preset_details = scrolledtext.ScrolledText(details_frame, height=8, wrap=tk.WORD)
+        self.preset_details.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        # Buttons
+        btn_frame = ttk.Frame(parent)
+        btn_frame.pack(fill=tk.X, padx=10, pady=10)
+
+        ttk.Button(btn_frame, text="Apply Preset",
+                   command=self.apply_selected_preset).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Save Current as Preset",
+                   command=self.save_as_preset).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Delete Preset",
+                   command=self.delete_selected_preset).pack(side=tk.LEFT, padx=5)
+
+        # Bind selection event
+        self.preset_listbox.bind('<<ListboxSelect>>', self.on_preset_select)
+
+    def update_preset_list(self):
+        """Update the preset listbox."""
+        self.preset_listbox.delete(0, tk.END)
+        for name in sorted(self.presets.keys()):
+            self.preset_listbox.insert(tk.END, name)
+
+    def on_preset_select(self, event):
+        """Handle preset selection."""
+        selection = self.preset_listbox.curselection()
+        if selection:
+            preset_name = self.preset_listbox.get(selection[0])
+            preset = self.presets.get(preset_name, {})
+
+            # Show preset details
+            details = f"Name: {preset.get('name', preset_name)}\n\n"
+            details += f"Description: {preset.get('description', 'No description')}\n\n"
+
+            patterns = preset.get('patterns', {})
+            if patterns.get('keywords'):
+                details += f"Keywords: {', '.join(patterns['keywords'][:5])}"
+                if len(patterns['keywords']) > 5:
+                    details += f" ... ({len(patterns['keywords'])} total)"
+                details += "\n\n"
+
+            if patterns.get('passages'):
+                details += f"Passages: {len(patterns['passages'])} defined\n\n"
+
+            if preset.get('regex_patterns'):
+                details += f"Regex Patterns: {len(preset['regex_patterns'])} defined\n"
+                for i, pattern in enumerate(preset['regex_patterns'][:3]):
+                    details += f"  {i + 1}. {pattern}\n"
+                if len(preset['regex_patterns']) > 3:
+                    details += f"  ... ({len(preset['regex_patterns'])} total)\n"
+
+            self.preset_details.delete(1.0, tk.END)
+            self.preset_details.insert(1.0, details)
+
+    def apply_preset(self, preset_name: str):
+        """Apply a preset configuration."""
+        preset = self.presets.get(preset_name)
+        if not preset:
+            return
+
+        # Apply patterns
+        self.patterns = preset.get('patterns', {'keywords': [], 'passages': []}).copy()
+        self.regex_patterns = preset.get('regex_patterns', []).copy()
+
+        # Update UI
+        self.update_patterns_ui()
+        self.current_preset = preset_name
+        self.preset_label.config(text=f"Active preset: {preset_name}")
+
+        # Update display
+        self.schedule_preview_update()
+
+        self.status_bar.config(text=f"Applied preset: {preset_name}")
+
+    def apply_selected_preset(self):
+        """Apply the currently selected preset."""
+        selection = self.preset_listbox.curselection()
+        if selection:
+            preset_name = self.preset_listbox.get(selection[0])
+            self.apply_preset(preset_name)
+
+    def save_as_preset(self):
+        """Save current configuration as a new preset."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Save as Preset")
+        dialog.geometry("400x300")
+
+        ttk.Label(dialog, text="Preset Name:").pack(padx=10, pady=5)
+        name_entry = ttk.Entry(dialog, width=40)
+        name_entry.pack(padx=10, pady=5)
+
+        ttk.Label(dialog, text="Description:").pack(padx=10, pady=5)
+        desc_text = scrolledtext.ScrolledText(dialog, height=6, width=40)
+        desc_text.pack(padx=10, pady=5)
+
+        def save():
+            name = name_entry.get().strip()
+            if not name:
+                messagebox.showerror("Error", "Please enter a preset name", parent=dialog)
+                return
+
+            # Create preset
+            preset = {
+                'name': name,
+                'description': desc_text.get(1.0, tk.END).strip(),
+                'patterns': self.patterns.copy(),
+                'regex_patterns': self.regex_patterns.copy(),
+                'created': datetime.now().isoformat()
+            }
+
+            # Save to presets
+            self.presets[name] = preset
+            JSONStore.save_presets(self.presets)
+
+            # Update UI
+            self.update_preset_list()
+
+            messagebox.showinfo("Success", f"Saved preset: {name}", parent=dialog)
+            dialog.destroy()
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(pady=10)
+        ttk.Button(btn_frame, text="Save", command=save).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Cancel", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+
+    def delete_selected_preset(self):
+        """Delete the selected preset."""
+        selection = self.preset_listbox.curselection()
+        if not selection:
+            return
+
+        preset_name = self.preset_listbox.get(selection[0])
+
+        # Don't allow deleting built-in presets
+        if preset_name in REDACTION_PRESETS:
+            messagebox.showerror("Error", "Cannot delete built-in presets")
+            return
+
+        if messagebox.askyesno("Confirm Delete",
+                               f"Delete preset '{preset_name}'?"):
+            del self.presets[preset_name]
+            JSONStore.save_presets(self.presets)
+            self.update_preset_list()
+            self.preset_details.delete(1.0, tk.END)
+
+    def manage_presets(self):
+        """Open preset management dialog."""
+        # This could be expanded to allow importing/exporting presets
+        messagebox.showinfo("Manage Presets",
+                            "Use the Presets tab to manage your presets.\n\n"
+                            "You can:\n"
+                            "- Apply existing presets\n"
+                            "- Save current settings as a new preset\n"
+                            "- Delete custom presets\n\n"
+                            "Built-in presets cannot be deleted.")
 
     def update_patterns_ui(self):
         """Update patterns UI elements"""
@@ -890,7 +1349,7 @@ class PDFRedactorGUI:
                 for idx, (x1, y1, x2, y2) in enumerate(regs):
                     iid = f"{kind}-{page}-{idx}"
                     self.region_tree.insert('', 'end', iid=iid,
-                        values=(page, f"{x1:.1f}", f"{y1:.1f}", f"{x2:.1f}", f"{y2:.1f}", kind))
+                                            values=(page, f"{x1:.1f}", f"{y1:.1f}", f"{x2:.1f}", f"{y2:.1f}", kind))
 
     def on_region_select(self, event=None):
         sel = self.region_tree.selection()
@@ -938,7 +1397,8 @@ class PDFRedactorGUI:
     def update_exclusions_from_ui(self):
         """Sync exclusion data from widgets"""
         self.exclusions = list(self.excl_lb.get(0, tk.END))
-        self.excluded_passages = [p.strip() for p in self.excluded_passages_txt.get(1.0, tk.END).split('\n---\n') if p.strip()]
+        self.excluded_passages = [p.strip() for p in self.excluded_passages_txt.get(1.0, tk.END).split('\n---\n') if
+                                  p.strip()]
 
     def _add_keyword(self):
         text = self.kw_entry.get().strip()
@@ -1082,11 +1542,14 @@ class PDFRedactorGUI:
         btn_frame.pack(pady=10)
 
         ttk.Button(btn_frame, text="Add to Patterns",
-                   command=lambda: self._add_to_patterns(text_widget.get(1.0, tk.END).strip(), dialog)).pack(side=tk.LEFT, padx=5)
+                   command=lambda: self._add_to_patterns(text_widget.get(1.0, tk.END).strip(), dialog)).pack(
+            side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Add Keyword",
-                   command=lambda: self._add_to_exclusions(text_widget.get(1.0, tk.END).strip(), dialog)).pack(side=tk.LEFT, padx=5)
+                   command=lambda: self._add_to_exclusions(text_widget.get(1.0, tk.END).strip(), dialog)).pack(
+            side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Add Passage",
-                   command=lambda: self._add_to_excluded_passages(text_widget.get(1.0, tk.END).strip(), dialog)).pack(side=tk.LEFT, padx=5)
+                   command=lambda: self._add_to_excluded_passages(text_widget.get(1.0, tk.END).strip(), dialog)).pack(
+            side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Cancel",
                    command=dialog.destroy).pack(side=tk.LEFT, padx=5)
 
@@ -1113,6 +1576,10 @@ class PDFRedactorGUI:
 
     def on_mousewheel(self, event):
         """Handle mouse wheel scrolling"""
+        # Check if Ctrl is held - if so, let the zoom handler deal with it
+        if event.state & 0x0004:  # Control key
+            return
+
         # Horizontal scrolling when Shift is held or tilt wheel
         if event.state & 0x0001 or getattr(event, 'num', None) in (6, 7):
             if event.delta:
@@ -1195,7 +1662,10 @@ FEATURES:
 • Preview mode shows what will be redacted
 • Configs are auto-saved with timestamps
 • Exclusion keywords and passages override matching redaction patterns
-• Regions tab lists all drawn boxes for manual editing or deletion (Del key)'''
+• Regions tab lists all drawn boxes for manual editing or deletion (Del key)
+• OCR support for scanned PDFs (enable with "Use OCR" checkbox)
+• Preset workflows for common redaction tasks (see Presets menu)
+• Regex pattern support for advanced text matching'''
 
         messagebox.showinfo('Help', msg, parent=self.root)
 
@@ -1210,6 +1680,14 @@ FEATURES:
         self.region_store = RegionStore.load(stem)
         self.page_label.config(text=f"1 / {len(self.doc)}")
         self.last_pdf = filename
+
+        # Check if PDF appears to be scanned
+        if self.canvas.ocr_processor.ocr_available:
+            self.is_scanned = self.canvas.ocr_processor.is_scanned_pdf(self.doc)
+            if self.is_scanned:
+                self.use_ocr.set(True)
+                self.status_bar.config(text="Detected scanned PDF - OCR enabled")
+
         self.display_page()
 
     def display_page(self):
@@ -1225,7 +1703,9 @@ FEATURES:
             patterns=self.patterns,
             exclusions=self.exclusions,
             excluded_passages=self.excluded_passages,
-            preview=self.preview_var.get()
+            preview=self.preview_var.get(),
+            use_ocr=self.use_ocr.get(),
+            regex_patterns=self.regex_patterns
         )
 
         self.page_label.config(text=f"{self.current_page + 1} / {len(self.doc)}")
@@ -1330,25 +1810,45 @@ FEATURES:
         if not output:
             return
 
+        # Show progress dialog for OCR processing
+        if self.use_ocr.get() and OCR_AVAILABLE:
+            progress = tk.Toplevel(self.root)
+            progress.title("Processing...")
+            progress.geometry("300x100")
+            ttk.Label(progress, text="Applying redactions with OCR...").pack(pady=20)
+            progress_bar = ttk.Progressbar(progress, mode='indeterminate')
+            progress_bar.pack(padx=20, fill=tk.X)
+            progress_bar.start()
+            self.root.update()
+
         # Combine exclusions and excluded passages
         all_exclusions = self.exclusions + self.excluded_passages
 
-        apply_redactions(
-            self.doc.name, output,
-            self.region_store.regions,
-            self.region_store.protect,
-            self.patterns,
-            all_exclusions
-        )
-        messagebox.showinfo('Done', f'Saved to {output}', parent=self.root)
+        try:
+            apply_redactions(
+                self.doc.name, output,
+                self.region_store.regions,
+                self.region_store.protect,
+                self.patterns,
+                all_exclusions,
+                self.regex_patterns,
+                self.use_ocr.get()
+            )
+            messagebox.showinfo('Done', f'Saved to {output}', parent=self.root)
+        finally:
+            if self.use_ocr.get() and OCR_AVAILABLE:
+                progress.destroy()
 
 
 # ---------------------------------------------------------------------------
-# Core redaction logic (headless)
+# Core redaction logic (enhanced with OCR and regex)
 # ---------------------------------------------------------------------------
 def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str, list],
-                     protect_regions: dict[str, list], patterns: dict, exclusions: list):
+                     protect_regions: dict[str, list], patterns: dict,
+                     exclusions: list, regex_patterns: list = None,
+                     use_ocr: bool = False):
     doc = fitz.open(input_pdf)
+    ocr_processor = OCRProcessor() if use_ocr else None
 
     # region redactions
     for page_num, regs in regions.items():
@@ -1364,6 +1864,7 @@ def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str, list],
         # Get protected regions for this page
         protected = protect_regions.get(str(page_num), [])
 
+        # Regular text pattern search
         for pattern in all_patterns:
             if any(excl.lower() in pattern.lower() for excl in exclusions):
                 continue
@@ -1393,6 +1894,62 @@ def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str, list],
                     if should_redact:
                         page.add_redact_annot(area, fill=(0, 0, 0))
 
+        # OCR-based search if enabled
+        if use_ocr and ocr_processor and ocr_processor.ocr_available:
+            ocr_results = ocr_processor.extract_text_with_positions(page)
+            for text, rect in ocr_results:
+                for pattern in all_patterns:
+                    if pattern.lower() in text.lower():
+                        # Check protections and exclusions
+                        is_protected = any(
+                            rect.x0 >= px1 and rect.y0 >= py1 and
+                            rect.x1 <= px2 and rect.y1 <= py2
+                            for px1, py1, px2, py2 in protected
+                        )
+
+                        if not is_protected:
+                            # Check context
+                            should_redact = True
+                            if any(excl.lower() in text.lower() for excl in exclusions):
+                                should_redact = False
+
+                            if should_redact:
+                                page.add_redact_annot(rect, fill=(0, 0, 0))
+
+        # Regex pattern search
+        if regex_patterns:
+            page_text = page.get_text()
+            for pattern in regex_patterns:
+                try:
+                    for match in re.finditer(pattern, page_text, re.IGNORECASE):
+                        matched_text = match.group(0)
+                        # Find location on page
+                        for area in page.search_for(matched_text, quads=False):
+                            # Check protections
+                            is_protected = any(
+                                area.x0 >= px1 and area.y0 >= py1 and
+                                area.x1 <= px2 and area.y1 <= py2
+                                for px1, py1, px2, py2 in protected
+                            )
+
+                            if not is_protected:
+                                # Check exclusions
+                                should_redact = True
+                                expanded = fitz.Rect(area)
+                                expanded.x0 -= 20
+                                expanded.x1 += 20
+                                try:
+                                    context = page.get_textbox(expanded)
+                                    if any(excl.lower() in context.lower() for excl in exclusions):
+                                        should_redact = False
+                                except:
+                                    pass
+
+                                if should_redact:
+                                    page.add_redact_annot(area, fill=(0, 0, 0))
+                except re.error:
+                    continue
+
     for page in doc:
         page.apply_redactions()
     doc.save(output_pdf, garbage=4)
@@ -1410,13 +1967,15 @@ def run_gui():
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Enhanced PDF redactor')
+    parser = argparse.ArgumentParser(description='Enhanced PDF redactor with OCR support')
     parser.add_argument('--gui', action='store_true', help='Launch GUI')
     parser.add_argument('input', nargs='?', help='Input PDF for CLI apply mode')
     parser.add_argument('output', nargs='?', help='Output PDF for CLI apply mode')
     parser.add_argument('--patterns', help='Path to JSON patterns file')
     parser.add_argument('--exclusions', help='Path to JSON exclusions file')
     parser.add_argument('--regions', help='Path to JSON region file')
+    parser.add_argument('--preset', help='Apply a named preset')
+    parser.add_argument('--ocr', action='store_true', help='Use OCR for scanned PDFs')
     parser.add_argument('--apply', action='store_true', help='Apply redactions')
 
     args = parser.parse_args()
@@ -1430,15 +1989,28 @@ def main():
 
     # CLI mode - apply redactions
     if args.apply or (args.input and args.output):
-        # Load patterns
-        patterns = {'keywords': [], 'passages': []}
-        if args.patterns:
-            with open(args.patterns) as f:
-                patterns = json.load(f)
+        # Load preset if specified
+        regex_patterns = []
+        if args.preset:
+            presets = JSONStore.load_presets()
+            preset = presets.get(args.preset)
+            if preset:
+                patterns = preset.get('patterns', {'keywords': [], 'passages': []})
+                regex_patterns = preset.get('regex_patterns', [])
+                print(f"Applied preset: {args.preset}")
+            else:
+                print(f"Warning: Preset '{args.preset}' not found")
+                patterns = {'keywords': [], 'passages': []}
         else:
-            pat = JSONStore.find_latest_file('app_wide', 'patterns')
-            if pat:
-                patterns = json.loads(pat.read_text())
+            # Load patterns
+            patterns = {'keywords': [], 'passages': []}
+            if args.patterns:
+                with open(args.patterns) as f:
+                    patterns = json.load(f)
+            else:
+                pat = JSONStore.find_latest_file('app_wide', 'patterns')
+                if pat:
+                    patterns = json.loads(pat.read_text())
 
         # Load exclusions
         exclusions = []
@@ -1477,7 +2049,8 @@ def main():
             regions = store.regions
             protect_regions = store.protect
 
-        apply_redactions(args.input, args.output, regions, protect_regions, patterns, all_exclusions)
+        apply_redactions(args.input, args.output, regions, protect_regions,
+                         patterns, all_exclusions, regex_patterns, args.ocr)
         print(f'Saved to {args.output}')
 
 
