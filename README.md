@@ -30,9 +30,10 @@
 - **Comprehensive Testing**: Extended unit test coverage for all components
 
 ### Needed Features
-- **Flexible Polygon**: Beyond the square drawing functionality a more dynamic redaction option must be employed through perhaps some...additional button beyond Draw Rectangle (R/P) like Draw Polygon (R/P) that allows a kind of point and click unlimited vericies that can form unusual stretches of redaction geometry for atypical files.
-- **More Supported Filetypes**: We desperately need to extend support for more filetypes including doc, docx, jpg, jpeg, png, gif, tif, svg, etc.
-- **Optional metadata scrubbing**: Whether via exif or other known method/mechanism being able to santise all possible identifiable information from the file's exif or native metadata in a dynamic filetype-specific way (microsoft word, microsoft powerpoint, pdfs, image filetypes). Another button or dropdown menu that can automatically detect and potentially list all known exif data of this entire file (in another bar tab beside the Patterns, Exclusions, Regions and Presets--should be [Metadata]). It should be a live editable menu, where users can either modify or completely scrub individual or unilaterally erase all metadata (to be applied to the file upon export, with all the information being stored in a respective json file)
+The latest version implements several of these requested features:
+- **Flexible Polygon**: New polygon drawing mode lets you freehand-draw redaction or protection areas.
+- **More Supported Filetypes**: The CLI and GUI now accept common image formats and DOC/DOCX files. Image conversion to PDF is optional via a new flag/checkbox.
+- **Optional metadata scrubbing**: A new checkbox and CLI flag remove document metadata when exporting.
   
 ### Patterns vs Exclusions
 
@@ -95,6 +96,7 @@ Use the GUI to open a PDF, draw boxes over regions to redact, manage keywords an
 - **Delete**: Remove selected region in Regions tab
 - **Preview** checkbox: See redactions applied live
 - **Use OCR** checkbox: Enable OCR for scanned PDFs (when available)
+- **Convert Images** checkbox: Convert opened images to PDF for processing
 
 ### Using Presets
 
@@ -130,6 +132,12 @@ Enable OCR for scanned PDFs:
 
 ```bash
 python redact_unified.py input.pdf output.pdf --ocr
+```
+
+Convert images to PDF before processing:
+
+```bash
+python redact_unified.py input.jpg output.pdf --convert-images
 ```
 
 ## Configuration Files

@@ -23,6 +23,7 @@ import time
 from pathlib import Path
 from enum import Enum, auto
 from typing import Optional, Dict, List, Tuple, Any
+import tempfile
 import threading
 import queue
 
@@ -47,6 +48,8 @@ class ToolMode(Enum):
     TEXT_SELECT = auto()
     DRAW_REDACT = auto()
     DRAW_PROTECT = auto()
+    DRAW_POLY_REDACT = auto()
+    DRAW_POLY_PROTECT = auto()
 
 
 # Preset definitions for common redaction workflows
@@ -186,6 +189,61 @@ class OCRProcessor:
 
 
 # ---------------------------------------------------------------------------
+# File conversion and metadata helpers
+# ---------------------------------------------------------------------------
+try:
+    from docx2pdf import convert as _docx2pdf_convert
+except Exception:
+    _docx2pdf_convert = None
+
+def convert_to_pdf(path: str) -> str:
+    """Convert common file types to PDF and return path to PDF."""
+    ext = Path(path).suffix.lower()
+    if ext == '.pdf':
+        return path
+    tmp_dir = Path(tempfile.gettempdir())
+    out_pdf = str(tmp_dir / (Path(path).stem + '.pdf'))
+    if ext in ['.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff', '.bmp']:
+        img = Image.open(path)
+        img.save(out_pdf, 'PDF')
+        return out_pdf
+    if ext in ['.doc', '.docx'] and _docx2pdf_convert:
+        _docx2pdf_convert(path, out_pdf)
+        return out_pdf
+    raise ValueError('Unsupported file type')
+
+def scrub_metadata(path: str):
+    """Remove metadata from file where possible."""
+    ext = Path(path).suffix.lower()
+    if ext == '.pdf':
+        doc = fitz.open(path)
+        doc.set_metadata({})
+        doc.saveIncr()
+        doc.close()
+    elif ext in ['.jpg', '.jpeg', '.png', '.tif', '.tiff', '.bmp']:
+        img = Image.open(path)
+        data = list(img.getdata())
+        img_no_meta = Image.new(img.mode, img.size)
+        img_no_meta.putdata(data)
+        img_no_meta.save(path)
+
+def apply_image_redactions(input_img: str, output_img: str,
+                           regions: dict[str, list], polygons: dict[str, list],
+                           scrub_meta: bool = False):
+    """Apply rectangular and polygon redactions directly on an image."""
+    img = Image.open(input_img).convert('RGB')
+    draw = ImageDraw.Draw(img)
+    rects = regions.get('0', [])
+    for x1, y1, x2, y2 in rects:
+        draw.rectangle([x1, y1, x2, y2], fill="black")
+    for pts in polygons.get('0', []):
+        draw.polygon(pts, fill="black")
+    img.save(output_img)
+    if scrub_meta:
+        scrub_metadata(output_img)
+
+
+# ---------------------------------------------------------------------------
 # JSONStore helper (enhanced with preset support)
 # ---------------------------------------------------------------------------
 class JSONStore:
@@ -276,6 +334,8 @@ class RegionStore:
     pdf_stem: str
     regions: dict[str, list] = field(default_factory=dict)
     protect: dict[str, list] = field(default_factory=dict)
+    polygons: dict[str, list] = field(default_factory=dict)
+    protect_polygons: dict[str, list] = field(default_factory=dict)
     history: list = field(default_factory=list)
     future: list = field(default_factory=list)
     last_autosave: float = 0.0
@@ -286,6 +346,8 @@ class RegionStore:
         state = {
             'regions': json.loads(json.dumps(self.regions)),
             'protect': json.loads(json.dumps(self.protect)),
+            'polygons': json.loads(json.dumps(self.polygons)),
+            'protect_polygons': json.loads(json.dumps(self.protect_polygons)),
         }
         self.history.append(state)
         if len(self.history) > self.MAX_HISTORY:
@@ -300,11 +362,30 @@ class RegionStore:
             self.regions.setdefault(str(page), []).append(bbox)
         self.autosave()
 
+    def add_polygon(self, page: int, points: list[float], kind: str = 'redact'):
+        self._snapshot()
+        if kind == 'protect':
+            self.protect_polygons.setdefault(str(page), []).append(points)
+        else:
+            self.polygons.setdefault(str(page), []).append(points)
+        self.autosave()
+
     def remove(self, page: int, index: int, kind: str = 'redact') -> bool:
         """Remove a region by page and index."""
         self._snapshot()
         key = str(page)
         items = self.protect if kind == 'protect' else self.regions
+        arr = items.get(key, [])
+        if 0 <= index < len(arr):
+            arr.pop(index)
+            self.autosave(force=True)
+            return True
+        return False
+
+    def remove_polygon(self, page: int, index: int, kind: str = 'redact') -> bool:
+        self._snapshot()
+        key = str(page)
+        items = self.protect_polygons if kind == 'protect' else self.polygons
         arr = items.get(key, [])
         if 0 <= index < len(arr):
             arr.pop(index)
@@ -324,22 +405,41 @@ class RegionStore:
             return True
         return False
 
+    def update_polygon(self, page: int, index: int, points: list[float], kind: str = 'redact') -> bool:
+        self._snapshot()
+        key = str(page)
+        items = self.protect_polygons if kind == 'protect' else self.polygons
+        arr = items.get(key, [])
+        if 0 <= index < len(arr):
+            arr[index] = points
+            self.autosave(force=True)
+            return True
+        return False
+
     def undo(self):
         if not self.history:
             return False
-        self.future.append({'regions': self.regions, 'protect': self.protect})
+        self.future.append({'regions': self.regions, 'protect': self.protect,
+                            'polygons': self.polygons,
+                            'protect_polygons': self.protect_polygons})
         state = self.history.pop()
         self.regions = state['regions']
         self.protect = state['protect']
+        self.polygons = state.get('polygons', {})
+        self.protect_polygons = state.get('protect_polygons', {})
         return True
 
     def redo(self):
         if not self.future:
             return False
-        self.history.append({'regions': self.regions, 'protect': self.protect})
+        self.history.append({'regions': self.regions, 'protect': self.protect,
+                            'polygons': self.polygons,
+                            'protect_polygons': self.protect_polygons})
         state = self.future.pop()
         self.regions = state['regions']
         self.protect = state['protect']
+        self.polygons = state.get('polygons', {})
+        self.protect_polygons = state.get('protect_polygons', {})
         return True
 
     def autosave(self, force: bool = False):
@@ -348,12 +448,22 @@ class RegionStore:
         now = time.time()
         if force or now - self.last_autosave > 5:
             path = JSONStore.DATA_DIR / f"{self.pdf_stem}_regions_autosave.json"
-            JSONStore.write_atomic(path, {'regions': self.regions, 'protect': self.protect})
+            JSONStore.write_atomic(path, {
+                'regions': self.regions,
+                'protect': self.protect,
+                'polygons': self.polygons,
+                'protect_polygons': self.protect_polygons
+            })
             self.last_autosave = now
 
     def save(self):
         fname = JSONStore.get_timestamped_filename(self.pdf_stem, 'regions')
-        JSONStore.write_atomic(fname, {'regions': self.regions, 'protect': self.protect})
+        JSONStore.write_atomic(fname, {
+            'regions': self.regions,
+            'protect': self.protect,
+            'polygons': self.polygons,
+            'protect_polygons': self.protect_polygons
+        })
 
     @classmethod
     def load(cls, pdf_stem: str):
@@ -363,6 +473,8 @@ class RegionStore:
             data = json.loads(path.read_text())
             obj.regions = data.get('regions', {})
             obj.protect = data.get('protect', {})
+            obj.polygons = data.get('polygons', {})
+            obj.protect_polygons = data.get('protect_polygons', {})
         return obj
 
 
@@ -395,6 +507,7 @@ class PDFCanvas(tk.Canvas):
         self.ocr_results = []
 
     def display(self, page: fitz.Page, regions: list[list], protect: list[list], scale: float = 2.0,
+                polygons: list[list] | None = None, protect_polygons: list[list] | None = None,
                 patterns: dict | None = None, exclusions: list | None = None,
                 excluded_passages: list | None = None, preview: bool = False,
                 use_ocr: bool = False, regex_patterns: list | None = None):
@@ -410,18 +523,30 @@ class PDFCanvas(tk.Canvas):
         img = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
         draw = ImageDraw.Draw(img, 'RGBA')
 
+        polygons = polygons or []
+        protect_polygons = protect_polygons or []
+
         # Draw regions
         for x1, y1, x2, y2 in regions:
             draw.rectangle([x1 * scale, y1 * scale, x2 * scale, y2 * scale], fill=(255, 0, 0, 80), outline='red',
                            width=2)
+        for pts in polygons:
+            scaled = [p * scale for p in pts]
+            draw.polygon(scaled, fill=(255, 0, 0, 80), outline='red')
         for x1, y1, x2, y2 in protect:
             draw.rectangle([x1 * scale, y1 * scale, x2 * scale, y2 * scale], fill=(0, 255, 0, 80), outline='green',
                            width=2)
+        for pts in protect_polygons:
+            scaled = [p * scale for p in pts]
+            draw.polygon(scaled, fill=(0, 255, 0, 80), outline='green')
 
         if preview:
             # Apply region redactions in preview
             for x1, y1, x2, y2 in regions:
                 draw.rectangle([x1 * scale, y1 * scale, x2 * scale, y2 * scale], fill='black')
+            for pts in polygons:
+                scaled = [p * scale for p in pts]
+                draw.polygon(scaled, fill='black')
 
             # Apply text pattern redactions in preview
             if patterns:
@@ -434,8 +559,9 @@ class PDFCanvas(tk.Canvas):
                     if any(excl.lower() in pat.lower() for excl in all_exclusions):
                         continue
 
+                    combined_protect = protect + [self._polygon_bbox(p) for p in protect_polygons]
                     for area in page.search_for(pat, quads=False):
-                        if self._should_redact_area(area, protect, all_exclusions, page):
+                        if self._should_redact_area(area, combined_protect, all_exclusions, page):
                             draw.rectangle([area.x0 * scale, area.y0 * scale, area.x1 * scale, area.y1 * scale],
                                            fill='black')
 
@@ -444,7 +570,7 @@ class PDFCanvas(tk.Canvas):
                     for text, rect in self.ocr_results:
                         for pat in patt_list:
                             if pat.lower() in text.lower():
-                                if self._should_redact_area(rect, protect, all_exclusions, page):
+                                if self._should_redact_area(rect, combined_protect, all_exclusions, page):
                                     draw.rectangle([rect.x0 * scale, rect.y0 * scale,
                                                     rect.x1 * scale, rect.y1 * scale], fill='black')
 
@@ -457,7 +583,7 @@ class PDFCanvas(tk.Canvas):
                             # Try to find the match location on the page
                             matched_text = match.group(0)
                             for area in page.search_for(matched_text, quads=False):
-                                if self._should_redact_area(area, protect, all_exclusions, page):
+                                if self._should_redact_area(area, combined_protect, all_exclusions, page):
                                     draw.rectangle([area.x0 * scale, area.y0 * scale,
                                                     area.x1 * scale, area.y1 * scale], fill='black')
                     except re.error:
@@ -467,6 +593,11 @@ class PDFCanvas(tk.Canvas):
         self.delete('all')
         self.create_image(0, 0, image=self.img, anchor='nw')
         self.config(scrollregion=self.bbox('all'))
+
+    def _polygon_bbox(self, pts: list[float]) -> Tuple[float, float, float, float]:
+        xs = pts[0::2]
+        ys = pts[1::2]
+        return min(xs), min(ys), max(xs), max(ys)
 
     def _should_redact_area(self, area: fitz.Rect, protect: list, exclusions: list, page: fitz.Page) -> bool:
         """Check if an area should be redacted based on protection and exclusions."""
@@ -574,6 +705,7 @@ class PDFRedactorGUI:
         # OCR settings
         self.use_ocr = tk.BooleanVar(value=False)
         self.is_scanned = False
+        self.convert_img_var = tk.BooleanVar(value=False)
 
         # Presets
         self.presets = JSONStore.load_presets()
@@ -630,6 +762,7 @@ class PDFRedactorGUI:
         self.root.bind('t', lambda e: self.set_tool_mode(ToolMode.TEXT_SELECT))
         self.root.bind('r', lambda e: self.set_tool_mode(ToolMode.DRAW_REDACT))
         self.root.bind('p', lambda e: self.set_tool_mode(ToolMode.DRAW_PROTECT))
+        self.root.bind('g', lambda e: self.set_tool_mode(ToolMode.DRAW_POLY_REDACT))
 
     def on_ctrl_mousewheel(self, event):
         """Handle Ctrl+MouseWheel for zooming"""
@@ -843,6 +976,8 @@ class PDFRedactorGUI:
                 self.last_pdf = data.get('last_pdf')
                 self.last_pane_position = data.get('pane_position')
                 self.last_zoom = data.get('last_zoom', 2.0)
+                self.convert_img_var.set(data.get('convert_images', False))
+                self.scrub_meta_var.set(data.get('scrub_metadata', False))
             except Exception:
                 pass
 
@@ -851,7 +986,9 @@ class PDFRedactorGUI:
             'window_geometry': self.root.geometry(),
             'last_pdf': getattr(self, 'last_pdf', ''),
             'pane_position': self.last_pane_position,
-            'last_zoom': getattr(self.canvas, 'scale', 2.0)
+            'last_zoom': getattr(self.canvas, 'scale', 2.0),
+            'convert_images': self.convert_img_var.get(),
+            'scrub_metadata': self.scrub_meta_var.get()
         }
         JSONStore.write_atomic(JSONStore.PREFS_FILE, data)
 
@@ -923,6 +1060,8 @@ class PDFRedactorGUI:
                         value=ToolMode.TEXT_SELECT.name, command=self.on_tool_change).pack(side=tk.LEFT)
         ttk.Radiobutton(tool_frame, text="Draw (R/P)", variable=self.tool_var,
                         value=ToolMode.DRAW_REDACT.name, command=self.on_tool_change).pack(side=tk.LEFT)
+        ttk.Radiobutton(tool_frame, text="Polygon (R/P)", variable=self.tool_var,
+                        value=ToolMode.DRAW_POLY_REDACT.name, command=self.on_tool_change).pack(side=tk.LEFT)
 
         # Drawing mode toggle (redact vs protect)
         draw_frame = ttk.LabelFrame(toolbar, text="Draw Mode")
@@ -956,6 +1095,10 @@ class PDFRedactorGUI:
         ttk.Checkbutton(toolbar, text='Use OCR', variable=self.use_ocr,
                         command=self.display_page,
                         state='normal' if OCR_AVAILABLE else 'disabled').pack(side=tk.LEFT)
+        self.scrub_meta_var = tk.BooleanVar()
+        ttk.Checkbutton(toolbar, text='Scrub Metadata', variable=self.scrub_meta_var).pack(side=tk.LEFT)
+        self.convert_img_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(toolbar, text='Convert Images', variable=self.convert_img_var).pack(side=tk.LEFT)
 
         ttk.Button(toolbar, text='Help', command=self.show_help).pack(side=tk.RIGHT, padx=5)
 
@@ -1470,7 +1613,9 @@ class PDFRedactorGUI:
             ToolMode.PAN: "Pan Mode - Click and drag to move",
             ToolMode.TEXT_SELECT: "Text Selection Mode - Click and drag to select text",
             ToolMode.DRAW_REDACT: "Draw Mode - Click and drag to create regions",
-            ToolMode.DRAW_PROTECT: "Draw Mode - Click and drag to create regions"
+            ToolMode.DRAW_PROTECT: "Draw Mode - Click and drag to create regions",
+            ToolMode.DRAW_POLY_REDACT: "Polygon Mode - Drag to draw freehand",
+            ToolMode.DRAW_POLY_PROTECT: "Polygon Mode - Drag to draw freehand"
         }
         self.status_bar.config(text=mode_names.get(mode, ""))
 
@@ -1480,10 +1625,10 @@ class PDFRedactorGUI:
         mode = ToolMode[mode_name]
 
         # If switching to draw mode, set appropriate drawing mode
-        if mode == ToolMode.DRAW_REDACT:
+        if mode in (ToolMode.DRAW_REDACT, ToolMode.DRAW_POLY_REDACT):
             self.mode_var.set('redact')
             self.drawing_mode = 'redact'
-        elif mode == ToolMode.DRAW_PROTECT:
+        elif mode in (ToolMode.DRAW_PROTECT, ToolMode.DRAW_POLY_PROTECT):
             self.mode_var.set('protect')
             self.drawing_mode = 'protect'
 
@@ -1494,9 +1639,15 @@ class PDFRedactorGUI:
         self.drawing_mode = self.mode_var.get()
         # Update tool mode to match
         if self.drawing_mode == 'redact':
-            self.set_tool_mode(ToolMode.DRAW_REDACT)
+            if self.current_tool in (ToolMode.DRAW_POLY_REDACT, ToolMode.DRAW_POLY_PROTECT):
+                self.set_tool_mode(ToolMode.DRAW_POLY_REDACT)
+            else:
+                self.set_tool_mode(ToolMode.DRAW_REDACT)
         else:
-            self.set_tool_mode(ToolMode.DRAW_PROTECT)
+            if self.current_tool in (ToolMode.DRAW_POLY_REDACT, ToolMode.DRAW_POLY_PROTECT):
+                self.set_tool_mode(ToolMode.DRAW_POLY_PROTECT)
+            else:
+                self.set_tool_mode(ToolMode.DRAW_PROTECT)
 
     # Canvas event handlers
     def on_canvas_press(self, event):
@@ -1504,7 +1655,8 @@ class PDFRedactorGUI:
             self.canvas.start_pan(event)
         elif self.current_tool == ToolMode.TEXT_SELECT:
             self.canvas.start_text_selection(event)
-        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT):
+        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT,
+                                   ToolMode.DRAW_POLY_REDACT, ToolMode.DRAW_POLY_PROTECT):
             self.start_draw(event)
 
     def on_canvas_drag(self, event):
@@ -1512,7 +1664,8 @@ class PDFRedactorGUI:
             self.canvas.drag_pan(event)
         elif self.current_tool == ToolMode.TEXT_SELECT:
             self.canvas.update_text_selection(event)
-        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT):
+        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT,
+                                   ToolMode.DRAW_POLY_REDACT, ToolMode.DRAW_POLY_PROTECT):
             self.update_draw(event)
 
     def on_canvas_release(self, event):
@@ -1523,7 +1676,8 @@ class PDFRedactorGUI:
                 self.status_bar.config(text=f"Selected: {text[:100]}...")
                 # Optionally show a dialog asking what to do with the text
                 self.show_text_action_dialog(text)
-        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT):
+        elif self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT,
+                                   ToolMode.DRAW_POLY_REDACT, ToolMode.DRAW_POLY_PROTECT):
             self.end_draw(event)
 
     def show_text_action_dialog(self, text):
@@ -1671,10 +1825,20 @@ FEATURES:
 
     # --------------------- PDF Handling ------------------------
     def open_pdf(self, path=None):
-        filename = path or filedialog.askopenfilename(filetypes=[('PDF files', '*.pdf')])
+        filetypes = [('Documents', '*.pdf *.jpg *.jpeg *.png *.gif *.tif *.tiff *.bmp *.doc *.docx')]
+        filename = path or filedialog.askopenfilename(filetypes=filetypes)
         if not filename:
             return
-        self.doc = fitz.open(filename)
+        try:
+            ext = Path(filename).suffix.lower()
+            if ext in ['.doc', '.docx'] or self.convert_img_var.get():
+                pdf_path = convert_to_pdf(filename)
+            else:
+                pdf_path = filename
+        except Exception:
+            messagebox.showerror('Error', 'Unsupported file type')
+            return
+        self.doc = fitz.open(pdf_path)
         self.current_page = 0
         stem = Path(filename).stem
         self.region_store = RegionStore.load(stem)
@@ -1696,9 +1860,12 @@ FEATURES:
         p = self.doc[self.current_page]
         regs = self.region_store.regions.get(str(self.current_page), []) if self.region_store else []
         prot = self.region_store.protect.get(str(self.current_page), []) if self.region_store else []
+        polys = self.region_store.polygons.get(str(self.current_page), []) if self.region_store else []
+        prot_polys = self.region_store.protect_polygons.get(str(self.current_page), []) if self.region_store else []
 
         self.canvas.display(
             p, regs, prot,
+            polygons=polys, protect_polygons=prot_polys,
             scale=self.canvas.scale,
             patterns=self.patterns,
             exclusions=self.exclusions,
@@ -1713,10 +1880,15 @@ FEATURES:
 
     # Drawing
     def start_draw(self, event):
-        self.start_x = self.canvas.canvasx(event.x) / self.canvas.scale
-        self.start_y = self.canvas.canvasy(event.y) / self.canvas.scale
-        color = 'red' if self.drawing_mode == 'redact' else 'green'
-        self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=color, width=2)
+        if self.current_tool in (ToolMode.DRAW_REDACT, ToolMode.DRAW_PROTECT):
+            self.start_x = self.canvas.canvasx(event.x) / self.canvas.scale
+            self.start_y = self.canvas.canvasy(event.y) / self.canvas.scale
+            color = 'red' if self.drawing_mode == 'redact' else 'green'
+            self.temp_rect = self.canvas.create_rectangle(event.x, event.y, event.x, event.y, outline=color, width=2)
+        else:
+            self.temp_poly_points = [self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)]
+            color = 'red' if self.drawing_mode == 'redact' else 'green'
+            self.temp_poly = self.canvas.create_line(*self.temp_poly_points, fill=color, width=2)
 
     def update_draw(self, event):
         if hasattr(self, 'temp_rect'):
@@ -1725,6 +1897,9 @@ FEATURES:
                                self.start_y * self.canvas.scale,
                                self.canvas.canvasx(event.x),
                                self.canvas.canvasy(event.y))
+        elif hasattr(self, 'temp_poly'):
+            self.temp_poly_points.extend([self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)])
+            self.canvas.coords(self.temp_poly, *self.temp_poly_points)
 
     def end_draw(self, event):
         if hasattr(self, 'temp_rect'):
@@ -1736,6 +1911,14 @@ FEATURES:
             self.canvas.delete(self.temp_rect)
             del self.temp_rect
             self.display_page()
+        elif hasattr(self, 'temp_poly'):
+            points = [p / self.canvas.scale for p in self.temp_poly_points]
+            if self.region_store and len(points) >= 6:
+                self.region_store.add_polygon(self.current_page, points, kind=self.drawing_mode)
+            self.canvas.delete(self.temp_poly)
+            del self.temp_poly
+            del self.temp_poly_points
+            self.display_page()
 
     # Region interaction helpers
     def find_region_at(self, x: float, y: float):
@@ -1745,28 +1928,51 @@ FEATURES:
         for i, (x1, y1, x2, y2) in enumerate(regs):
             if x1 <= x <= x2 and y1 <= y <= y2:
                 return 'redact', i
+        poly_regs = self.region_store.polygons.get(page_key, []) if self.region_store else []
+        for i, pts in enumerate(poly_regs):
+            xs = pts[0::2]; ys = pts[1::2]
+            if min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys):
+                return 'redact_poly', i
         prot = self.region_store.protect.get(page_key, []) if self.region_store else []
         for i, (x1, y1, x2, y2) in enumerate(prot):
             if x1 <= x <= x2 and y1 <= y <= y2:
                 return 'protect', i
+        prot_polys = self.region_store.protect_polygons.get(page_key, []) if self.region_store else []
+        for i, pts in enumerate(prot_polys):
+            xs = pts[0::2]; ys = pts[1::2]
+            if min(xs) <= x <= max(xs) and min(ys) <= y <= max(ys):
+                return 'protect_poly', i
         return None
 
     def delete_region(self, kind: str, index: int):
-        if self.region_store and self.region_store.remove(self.current_page, index, kind=kind):
-            self.display_page()
+        if not self.region_store:
+            return
+        if 'poly' in kind:
+            base = 'protect' if kind.startswith('protect') else 'redact'
+            self.region_store.remove_polygon(self.current_page, index, kind=base)
+        else:
+            self.region_store.remove(self.current_page, index, kind=kind)
+        self.display_page()
 
     def toggle_region_kind(self, kind: str, index: int):
         if not self.region_store:
             return
         page_key = str(self.current_page)
-        if kind == 'redact':
-            rect = self.region_store.regions[page_key][index]
-            self.region_store.remove(self.current_page, index, 'redact')
-            self.region_store.add(self.current_page, rect, kind='protect')
+        if kind in ('redact', 'protect'):
+            if kind == 'redact':
+                rect = self.region_store.regions[page_key][index]
+                self.region_store.remove(self.current_page, index, 'redact')
+                self.region_store.add(self.current_page, rect, kind='protect')
+            else:
+                rect = self.region_store.protect[page_key][index]
+                self.region_store.remove(self.current_page, index, 'protect')
+                self.region_store.add(self.current_page, rect, kind='redact')
         else:
-            rect = self.region_store.protect[page_key][index]
-            self.region_store.remove(self.current_page, index, 'protect')
-            self.region_store.add(self.current_page, rect, kind='redact')
+            base = 'protect' if kind.startswith('protect') else 'redact'
+            polys = (self.region_store.protect_polygons if base == 'protect' else self.region_store.polygons)[page_key]
+            pts = polys[index]
+            self.region_store.remove_polygon(self.current_page, index, base)
+            self.region_store.add_polygon(self.current_page, pts, kind='protect' if base=='redact' else 'redact')
         self.display_page()
 
     def on_canvas_right_click(self, event):
@@ -1806,7 +2012,14 @@ FEATURES:
         if not self.doc:
             return
         self.region_store.save()
-        output = filedialog.asksaveasfilename(defaultextension='.pdf', filetypes=[('PDF', '*.pdf')])
+        img_exts = ['.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff', '.bmp']
+        src_ext = Path(self.last_pdf).suffix.lower()
+        def_ext = '.pdf'
+        types = [('PDF', '*.pdf')]
+        if src_ext in img_exts and not self.convert_img_var.get():
+            def_ext = src_ext
+            types = [('Image', '*' + def_ext)]
+        output = filedialog.asksaveasfilename(defaultextension=def_ext, filetypes=types)
         if not output:
             return
 
@@ -1829,10 +2042,14 @@ FEATURES:
                 self.doc.name, output,
                 self.region_store.regions,
                 self.region_store.protect,
+                self.region_store.polygons,
+                self.region_store.protect_polygons,
                 self.patterns,
                 all_exclusions,
                 self.regex_patterns,
-                self.use_ocr.get()
+                self.use_ocr.get(),
+                scrub_meta=self.scrub_meta_var.get(),
+                convert_images=self.convert_img_var.get()
             )
             messagebox.showinfo('Done', f'Saved to {output}', parent=self.root)
         finally:
@@ -1844,17 +2061,42 @@ FEATURES:
 # Core redaction logic (enhanced with OCR and regex)
 # ---------------------------------------------------------------------------
 def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str, list],
-                     protect_regions: dict[str, list], patterns: dict,
+                     protect_regions: dict[str, list], polygons: dict[str, list],
+                     protect_polygons: dict[str, list], patterns: dict,
                      exclusions: list, regex_patterns: list = None,
-                     use_ocr: bool = False):
-    doc = fitz.open(input_pdf)
+                     use_ocr: bool = False, scrub_meta: bool = False,
+                     convert_images: bool = False):
+    ext = Path(input_pdf).suffix.lower()
+    img_exts = ['.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff', '.bmp']
+    if ext in img_exts and not convert_images:
+        apply_image_redactions(
+            input_pdf, output_pdf, regions, polygons, scrub_meta)
+        return
+    if ext in ['.doc', '.docx'] or (ext in img_exts and convert_images):
+        input_path = convert_to_pdf(input_pdf)
+    else:
+        input_path = input_pdf
+    doc = fitz.open(input_path)
+    if scrub_meta:
+        try:
+            doc.set_metadata({})
+        except Exception:
+            pass
     ocr_processor = OCRProcessor() if use_ocr else None
 
-    # region redactions
+    # region redactions - rectangles
     for page_num, regs in regions.items():
         page = doc[int(page_num)]
         for x1, y1, x2, y2 in regs:
             page.add_redact_annot(fitz.Rect(x1, y1, x2, y2), fill=(0, 0, 0))
+    # polygon redactions (approx by bounding box)
+    for page_num, polys in polygons.items():
+        page = doc[int(page_num)]
+        for pts in polys:
+            xs = pts[0::2]
+            ys = pts[1::2]
+            rect = fitz.Rect(min(xs), min(ys), max(xs), max(ys))
+            page.add_redact_annot(rect, fill=(0, 0, 0))
 
     # text patterns
     all_patterns = patterns.get('keywords', []).copy()
@@ -1862,7 +2104,10 @@ def apply_redactions(input_pdf: str, output_pdf: str, regions: dict[str, list],
 
     for page_num, page in enumerate(doc):
         # Get protected regions for this page
-        protected = protect_regions.get(str(page_num), [])
+        protected = protect_regions.get(str(page_num), []) + [
+            (min(p[0::2]), min(p[1::2]), max(p[0::2]), max(p[1::2]))
+            for p in protect_polygons.get(str(page_num), [])
+        ]
 
         # Regular text pattern search
         for pattern in all_patterns:
@@ -1976,6 +2221,9 @@ def main():
     parser.add_argument('--regions', help='Path to JSON region file')
     parser.add_argument('--preset', help='Apply a named preset')
     parser.add_argument('--ocr', action='store_true', help='Use OCR for scanned PDFs')
+    parser.add_argument('--scrub-metadata', action='store_true', help='Remove metadata from output')
+    parser.add_argument('--convert-images', action='store_true',
+                        help='Convert image files to PDF before processing')
     parser.add_argument('--apply', action='store_true', help='Apply redactions')
 
     args = parser.parse_args()
@@ -2039,18 +2287,27 @@ def main():
         # Load regions
         regions = {}
         protect_regions = {}
+        polygons = {}
+        protect_polygons = {}
         if args.regions:
             with open(args.regions) as f:
                 data = json.load(f)
                 regions = data.get('regions', {})
                 protect_regions = data.get('protect', {})
+                polygons = data.get('polygons', {})
+                protect_polygons = data.get('protect_polygons', {})
         else:
             store = RegionStore.load(Path(args.input).stem)
             regions = store.regions
             protect_regions = store.protect
+            polygons = store.polygons
+            protect_polygons = store.protect_polygons
 
         apply_redactions(args.input, args.output, regions, protect_regions,
-                         patterns, all_exclusions, regex_patterns, args.ocr)
+                         polygons, protect_polygons,
+                         patterns, all_exclusions, regex_patterns,
+                         args.ocr, scrub_meta=args.scrub_metadata,
+                         convert_images=args.convert_images)
         print(f'Saved to {args.output}')
 
 
