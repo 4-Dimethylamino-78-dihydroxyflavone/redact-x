@@ -1,6 +1,6 @@
-# Redactor X - 2025-06-28-1342
+# Redact-X - 2025-06-28-1342
 
-`redact_unified.py` provides both a graphical and command-line interface for redacting PDF files. This enhanced version includes OCR support for scanned PDFs, preset workflows, improved zoom controls, and comprehensive testing.
+`redact-x_unified.py` provides both a graphical and command-line interface for redacting PDF files. This enhanced version includes OCR support for scanned PDFs, preset workflows, improved zoom controls, and comprehensive testing.
 
 ## Features
 
