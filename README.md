@@ -78,7 +78,7 @@ pip install pytest pytest-cov pytest-mock pyinstaller
 Run the script without arguments or with the `--gui` flag:
 
 ```bash
-python redact_unified.py --gui
+python redact-x_unified.py --gui
 ```
 
 Use the GUI to open a PDF, draw boxes over regions to redact, manage keywords and passage lists, then choose **Save Redacted** to export a new PDF.
